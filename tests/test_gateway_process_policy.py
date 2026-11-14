@@ -7,7 +7,8 @@ import sys
 import tempfile
 import unittest
 
-from scripts.gateway_process_policy import PRUNE_BODY, canonical_owned_path, scratch_command_verdict
+from scripts.gateway_process_policy import (PRUNE_BODY, canonical_owned_path, readonly_git_verdict,
+                                            scratch_command_verdict)
 
 
 class ScratchAdmissionTests(unittest.TestCase):
@@ -66,6 +67,34 @@ class ScratchAdmissionTests(unittest.TestCase):
             bad = list(self.argv)
             bad[5] = str(alias)
             self.assertEqual("scratch_target_escape_or_alias", self.verdict(bad))
+
+
+class ReadonlyGitAdmissionTests(unittest.TestCase):
+    """Core e8bef69f version fingerprinting probes read the fixture checkout only."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="gw-git-policy-")
+        self.addCleanup(self.temp.cleanup)
+        self.core = Path(self.temp.name).resolve() / "core"
+        self.core.mkdir()
+
+    def test_current_readonly_version_probes_are_admitted(self):
+        for command in (["git", "branch", "--show-current"],
+                        ["git", "rev-list", "--count", "v0.23.1..HEAD"],
+                        ["git", "--no-optional-locks", "status", "--porcelain", "-uno"],
+                        ["git", "-C", str(self.core), "rev-parse", "HEAD"],
+                        ["git", "tag", "--merged", "HEAD", "--list", "v[0-9]*"],
+                        ["git", "log", "-1", "--format=%ct", "HEAD"]):
+            with self.subTest(command=command):
+                self.assertTrue(readonly_git_verdict(command, self.core))
+
+    def test_mutating_foreign_or_incomplete_git_never_admitted(self):
+        for command in (["git"], ["git", "commit", "-m", "x"], ["git", "checkout", "main"],
+                        ["git", "-C", str(self.core.parent), "status"], ["git", "-C", str(self.core)],
+                        ["git", "--no-optional-locks"], ["git", "-c", "user.name=x", "commit"],
+                        ["python", "status"], [], "git status"):
+            with self.subTest(command=command):
+                self.assertFalse(readonly_git_verdict(command, self.core))
 
 
 if __name__ == "__main__":

@@ -101,6 +101,18 @@ class GatewayEvidenceTests(unittest.TestCase):
                 self.assertEqual(503, observation["http_status"])
                 self.assertFalse(gateway.is_ready(value, 101))
 
+    def test_api_server_dependency_preflight_fails_closed_before_any_launch(self):
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+        import unittest.mock
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "receipt.json"
+            with unittest.mock.patch.object(importlib.util, "find_spec", return_value=None):
+                self.assertEqual(1, gateway.main(["--hermes-root", temp, "--candidate-sha",
+                                                  "a" * 40, "--output", str(output)]))
+        self.assertFalse(output.exists())
+
     def test_stage_fails_instead_of_promoting_cleanup_or_ready_to_success(self):
         receipt = self.receipt()
         for stage in ("candidate_install", "gateway_ready", "provider_factory", "initialize",
