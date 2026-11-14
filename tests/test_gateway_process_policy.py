@@ -84,7 +84,11 @@ class ReadonlyGitAdmissionTests(unittest.TestCase):
                         ["git", "--no-optional-locks", "status", "--porcelain", "-uno"],
                         ["git", "-C", str(self.core), "rev-parse", "HEAD"],
                         ["git", "tag", "--merged", "HEAD", "--list", "v[0-9]*"],
-                        ["git", "log", "-1", "--format=%ct", "HEAD"]):
+                        ["git", "log", "-1", "--format=%ct", "HEAD"],
+                        ["git", "diff", "--name-only", "--no-renames", "--diff-filter=D", "-z",
+                         "e8bef69f", "HEAD"],
+                        ["git", "symbolic-ref", "HEAD"], ["git", "describe", "--tags"],
+                        ["git", "tag"]):
             with self.subTest(command=command):
                 self.assertTrue(readonly_git_verdict(command, self.core))
 
@@ -92,7 +96,16 @@ class ReadonlyGitAdmissionTests(unittest.TestCase):
         for command in (["git"], ["git", "commit", "-m", "x"], ["git", "checkout", "main"],
                         ["git", "-C", str(self.core.parent), "status"], ["git", "-C", str(self.core)],
                         ["git", "--no-optional-locks"], ["git", "-c", "user.name=x", "commit"],
-                        ["python", "status"], [], "git status"):
+                        ["python", "status"], [], "git status",
+                        ["git", "branch", "-D", "main"], ["git", "branch", "new-branch"],
+                        ["git", "branch", "-m", "old", "new"], ["git", "tag", "v1.0"],
+                        ["git", "tag", "-d", "v1.0"], ["git", "tag", "-a", "-m", "x", "v1"],
+                        ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                        ["git", "symbolic-ref", "-d", "HEAD"], ["git", "status"],
+                        ["git", "status", "--porcelain"],
+                        ["git", "log", "--output=/tmp/x"], ["git", "diff", "--ext-diff"],
+                        ["git", "diff", "--textconv"], ["git", "-C", str(self.core), "-C",
+                        "/etc", "status"]):
             with self.subTest(command=command):
                 self.assertFalse(readonly_git_verdict(command, self.core))
 

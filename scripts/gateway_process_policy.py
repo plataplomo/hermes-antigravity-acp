@@ -14,10 +14,14 @@ from typing import Sequence
 PRUNE_BODY = ("import sys; sys.path[:] = sys.argv[3:]; "
               "import hermes_constants_scratch_detach as d; d.run(*sys.argv[1:3])")
 
-# Core e8bef69f version fingerprinting probes (issue #28 Hosted diagnosis). Widening this
-# set beyond read-only plumbing verbs is a policy change, not a compatibility fix.
-READONLY_GIT_SUBCOMMANDS = frozenset({"rev-parse", "describe", "status", "symbolic-ref",
-                                      "log", "diff", "tag", "branch", "rev-list"})
+# Core e8bef69f version fingerprinting probes (issue #28 Hosted diagnosis). Verbs alone
+# are unsafe: `branch <name>`/`branch -D`, `tag <name>`/`tag -d` and `symbolic-ref <ref>
+# <target>` mutate. Admission is verb plus flag-shape, and widening it is a policy change.
+READONLY_GIT_BRANCH_FLAGS = frozenset({"-a", "-r", "-v", "-vv", "-l", "--all", "--remotes",
+                                       "--list", "--show-current", "--color", "--no-color"})
+READONLY_GIT_TAG_LIST_FLAGS = frozenset({"-l", "--list", "-n", "--contains", "--no-contains",
+                                         "--merged", "--no-merged", "--sort", "--format",
+                                         "--color", "--no-color"})
 
 
 def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
@@ -27,7 +31,8 @@ def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
     if Path(os.fsdecode(command[0])).name != "git":
         return False
     args = [os.fsdecode(value) for value in command[1:]]
-    if args[:1] == ["--no-optional-locks"]:
+    no_locks = args[:1] == ["--no-optional-locks"]
+    if no_locks:
         args = args[1:]
     if args[:1] == ["-C"]:
         if len(args) < 3:
@@ -38,7 +43,34 @@ def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
         except OSError:
             return False
         args = args[2:]
-    return bool(args) and args[0] in READONLY_GIT_SUBCOMMANDS
+    if not args:
+        return False
+    verb, flags = args[0], args[1:]
+    if verb in {"rev-parse", "rev-list", "describe"}:
+        return True
+    if verb == "status":
+        # Without --no-optional-locks git refreshes the index, a write outside the root
+        # that the in-process audit cannot observe in the git child.
+        return no_locks
+    if verb in {"log", "diff"}:
+        return not any(f == "--ext-diff" or f == "--textconv" or f.startswith("--output")
+                       for f in flags)
+    if verb == "branch":
+        positional = [flag for flag in flags if not flag.startswith("-")]
+        if positional and "--list" not in flags and "-l" not in flags:
+            return False
+        return all(flag.split("=")[0] in READONLY_GIT_BRANCH_FLAGS
+                   for flag in flags if flag.startswith("-"))
+    if verb == "tag":
+        if not flags:
+            return True  # bare `tag` lists
+        if "--list" not in flags and "-l" not in flags:
+            return False
+        return all(flag.split("=")[0] in READONLY_GIT_TAG_LIST_FLAGS
+                   for flag in flags if flag.startswith("-"))
+    if verb == "symbolic-ref":
+        return len(args) == 2 and not args[1].startswith("-")
+    return False
 
 
 def canonical_owned_path(value: str, root: Path) -> Path | None:

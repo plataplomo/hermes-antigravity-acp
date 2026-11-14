@@ -224,8 +224,12 @@ A second latent defect would have kept CI red after the dependency fix: the enve
 read-only git allowlist was stale against Core `e8bef69f` version fingerprinting
 (`branch --show-current`, `rev-list --count`, `--no-optional-locks status`), producing sticky
 `unapproved_subprocess` refusals and an isolation FAIL. The verdict moved into
-`gateway_process_policy.readonly_git_verdict` with positive/negative tests; mutation verbs
-and foreign `-C` targets remain refused.
+`gateway_process_policy.readonly_git_verdict` with positive/negative tests. Independent
+review proved a verb-only allowlist is unsafe (`branch -D`, `branch <name>`, `tag <name>`,
+`tag -d` all passed), so admission is verb plus flag-shape: list-only branch/tag forms,
+`status` only with `--no-optional-locks` (index refresh is an unobservable child write),
+`log`/`diff` without `--output`/`--ext-diff`/`--textconv`, single-ref `symbolic-ref`.
+Mutation verbs and foreign `-C` targets remain refused.
 
 `scratch_cleanup launch_count=0` is downstream of READY, not an independent defect: Core
 spawns the detached pruner only from `get_scratch_dir(prune=True)` call sites (for example
