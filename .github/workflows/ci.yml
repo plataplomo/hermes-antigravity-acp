@@ -817,7 +817,10 @@ jobs:
           printf 'NousResearch/hermes-agent main %s\nTree %s\n' "$commit" "$tree" > upstream-hermes-provenance.txt
       - name: Install official Hermes from its committed lock
         working-directory: upstream-hermes
-        run: uv sync --frozen --python 3.14 --group dev
+        # The messaging extra provides the aiohttp that Core's api_server adapter requires
+        # (optional dependency; run 43611722789 proved the base sync leaves the Gateway with
+        # no HTTP listener, so READY can never pass without it).
+        run: uv sync --frozen --python 3.14 --group dev --extra messaging
       - name: Record resolved dependency versions
         working-directory: upstream-hermes
         run: |

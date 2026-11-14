@@ -14,6 +14,32 @@ from typing import Sequence
 PRUNE_BODY = ("import sys; sys.path[:] = sys.argv[3:]; "
               "import hermes_constants_scratch_detach as d; d.run(*sys.argv[1:3])")
 
+# Core e8bef69f version fingerprinting probes (issue #28 Hosted diagnosis). Widening this
+# set beyond read-only plumbing verbs is a policy change, not a compatibility fix.
+READONLY_GIT_SUBCOMMANDS = frozenset({"rev-parse", "describe", "status", "symbolic-ref",
+                                      "log", "diff", "tag", "branch", "rev-list"})
+
+
+def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
+    """True only for read-only git probes; mutation verbs and foreign -C targets stay refused."""
+    if not isinstance(command, (list, tuple)) or not command:
+        return False
+    if Path(os.fsdecode(command[0])).name != "git":
+        return False
+    args = [os.fsdecode(value) for value in command[1:]]
+    if args[:1] == ["--no-optional-locks"]:
+        args = args[1:]
+    if args[:1] == ["-C"]:
+        if len(args) < 3:
+            return False
+        try:
+            if Path(args[1]).resolve() != core.resolve():
+                return False
+        except OSError:
+            return False
+        args = args[2:]
+    return bool(args) and args[0] in READONLY_GIT_SUBCOMMANDS
+
 
 def canonical_owned_path(value: str, root: Path) -> Path | None:
     """Require exact absolute spelling, no dot segments, aliases or symlink components."""

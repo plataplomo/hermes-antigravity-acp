@@ -17,7 +17,7 @@ import threading
 import traceback
 
 from gateway_docker import namespace_verified
-from gateway_process_policy import PRUNE_BODY, scratch_command_verdict, shutdown_command_verified
+from gateway_process_policy import PRUNE_BODY, readonly_git_verdict, scratch_command_verdict, shutdown_command_verified
 from provider_origin import ProviderOrigin
 
 
@@ -101,10 +101,7 @@ def main() -> None:
                 if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"}:
                     reject("subprocess_executable_mismatch")
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
-            git_args = list(command[1:])
-            if len(git_args) >= 2 and git_args[0] == "-C" and Path(git_args[1]).resolve() == core:
-                git_args = git_args[2:]
-            is_readonly_git = name == "git" and bool(git_args) and git_args[0] in {"rev-parse", "describe", "status", "symbolic-ref", "log", "diff", "tag"}
+            is_readonly_git = readonly_git_verdict(command, core)
             housekeeping = False
             if PRUNE_BODY in command:
                 verdict = scratch_command_verdict(str(args[0]), command, root, core, sys.executable, sys.path)

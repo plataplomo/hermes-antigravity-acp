@@ -203,6 +203,45 @@ reservation socket until the Gateway's own bind, closing it only at launch. This
 removes the kernel-allocation steal window entirely for the tested class; whether
 it was the prior failure's actual cause is only answered by a new-HEAD Hosted run.
 
+## 2026-11-15 confirmed Hosted READY root cause (runs 43470290348 and 43611722789)
+
+Both Hosted READY timeouts share one confirmed cause: Core's `api_server` adapter requires
+`aiohttp`, which Core declares only in optional extras (`messaging`/`slack`/`matrix`). The
+Gateway E2E job provisioned Core with base `uv sync --frozen --group dev`, so
+`check_api_server_requirements()` returned False, `start_gateway` logged
+`No adapter available for api_server` and booted with no HTTP listener. The harness observed
+bare `connection_refused` for the full 60-second window. `b51a30c` already imported aiohttp,
+so the older failure had the same cause; the port-reservation change stays as hardening but
+the port-stealing theory is retired as the explanation for these runs.
+
+Local dirty diagnostics (never candidate evidence) on Core `e8bef69f` with the harness's exact
+disposable-home configuration: without aiohttp the process stayed alive 240 seconds without
+ever binding; with `aiohttp==3.14.5` it listened in 5.8s and reached READY in 6.4s, and with
+the full audit+profile envelope (namespace gate patched, 2-CPU emulation) READY took 11.0s.
+The 60-second deadline was never the constraint.
+
+A second latent defect would have kept CI red after the dependency fix: the envelope's
+read-only git allowlist was stale against Core `e8bef69f` version fingerprinting
+(`branch --show-current`, `rev-list --count`, `--no-optional-locks status`), producing sticky
+`unapproved_subprocess` refusals and an isolation FAIL. The verdict moved into
+`gateway_process_policy.readonly_git_verdict` with positive/negative tests; mutation verbs
+and foreign `-C` targets remain refused.
+
+`scratch_cleanup launch_count=0` is downstream of READY, not an independent defect: Core
+spawns the detached pruner only from `get_scratch_dir(prune=True)` call sites (for example
+per-request prompt building), and the boot temp-env hook skips when `TMPDIR` is preset. No
+READY meant no request meant no prune attempt. The envelope-parity local run confirmed the
+original pruner is admitted, removes the fresh idle probe, retains the active probe and
+writes a non-empty prune log.
+
+Known diagnostic gap kept open deliberately: `cleanup()` overwrites an isolation
+`BLOCKED sticky_boundary_refusal` with the scratch FAIL detail, so the schema-1 receipt
+cannot distinguish refusals from missing pruning, and raw `gateway.log` stays inside the
+disposable root. Preserving a fixed refusal count in the receipt requires a schema change
+and is not part of this fix. The driver now fails fast with the fixed
+`api_server_dependency_missing` detail when the interpreter lacks aiohttp, so a
+provisioning gap can never again masquerade as a Gateway startup timeout.
+
 ## CI gating policy
 
 The existing `os_lanes` risk decision conservatively also requires Gateway E2E.

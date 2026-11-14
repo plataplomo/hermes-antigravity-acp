@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import random
@@ -522,6 +523,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--keep-diagnostics", action="store_true", help="local development only; never upload raw logs")
     args = parser.parse_args(argv)
+    # Hosted diagnosis (issue #28, run 43611722789): Core's api_server adapter degrades to
+    # "no adapter available" when aiohttp is absent, so the Gateway boots but never binds and
+    # READY times out as bare connection_refused. Fail fast here with the fixed cause instead
+    # of burning the 60-second window and mislabing a provisioning gap as a Gateway failure.
+    if importlib.util.find_spec("aiohttp") is None:
+        print(json.dumps({"status": "FAIL", "detail": "api_server_dependency_missing"}))
+        return 1
     repo = Path(__file__).resolve().parent.parent
     core = args.hermes_root.resolve(strict=True)
     if not HEX40.fullmatch(args.candidate_sha) or _git(repo, "rev-parse", "HEAD") != args.candidate_sha:
