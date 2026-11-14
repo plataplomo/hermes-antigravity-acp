@@ -431,7 +431,8 @@ def _gateway_outputs(candidate="a" * 40):
     from scripts.gateway_docker import CHECKS
     # Synthetic UNIT input, never an execution receipt.
     return {"attested_sha": candidate, "gateway_core": "b" * 40, "gateway_result": "success", "gateway_record": json.dumps({
-        "schema_version": 1, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
+        "schema_version": 2, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
+        "boundary_refusal_reasons": [],
         "candidate_source_dirty": False,
         "provider_origin": {"status": "PASS", "candidate_sha": candidate, "tree_sha256": "3" * 64,
                             "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},

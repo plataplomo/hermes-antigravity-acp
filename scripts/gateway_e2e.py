@@ -43,12 +43,24 @@ REQUIRED_STAGES = (
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 
 
+def boundary_refusal_reasons(envelopes: list[dict]) -> list[str]:
+    """Fixed audit/provider-origin enum only; argv, paths and frames never reach the receipt."""
+    reasons = set()
+    for envelope in envelopes:
+        for reason in envelope.get("refusals", []):
+            if isinstance(reason, str) and reason.replace("_", "").isalnum():
+                reasons.add(reason)
+    return sorted(reasons)
+
+
 def validate_receipt(receipt: object, candidate: str) -> list[str]:
     if not isinstance(receipt, dict):
         return ["receipt_not_object"]
     problems = []
-    if type(receipt.get("schema_version")) is not int or receipt["schema_version"] != 1:
+    if type(receipt.get("schema_version")) is not int or receipt["schema_version"] != 2:
         problems.append("invalid_schema")
+    if not isinstance(receipt.get("boundary_refusal_reasons"), list):
+        problems.append("boundary_refusals_unrecorded")
     if receipt.get("candidate_sha") != candidate or not HEX40.fullmatch(candidate):
         problems.append("candidate_identity_mismatch")
     if not isinstance(receipt.get("hermes_commit"), str) or not HEX40.fullmatch(receipt["hermes_commit"]):
@@ -162,7 +174,7 @@ class Run:
         self.started = time.monotonic()
         self.key = secrets.token_urlsafe(24)  # transport-only fixture key, not a vendor credential
         self.port = 0
-        self.record = {"schema_version": 1, "candidate_sha": candidate,
+        self.record = {"schema_version": 2, "candidate_sha": candidate,
                        "hermes_commit": _git(core, "rev-parse", "HEAD"), "status": "FAIL",
                        "stages": {name: {"status": "NOT_RUN", "detail": "not_executed"} for name in REQUIRED_STAGES}}
         self.current = "isolation"
@@ -482,12 +494,15 @@ class Run:
         self.record["live_owned_children_after_exit"] = sum(_live(pid, token) for pid, token in pids.items())
         boundary_ok = True
         housekeeping = []
+        envelope_values = []
         for name in ("gateway-envelope.json", "contender-envelope.json"):
             path = self.root / name
             if path.exists():
                 envelope = json.loads(path.read_text())
+                envelope_values.append(envelope)
                 boundary_ok = boundary_ok and not envelope.get("refusals")
                 housekeeping.extend(envelope.get("housekeeping", []))
+        self.record["boundary_refusal_reasons"] = boundary_refusal_reasons(envelope_values)
         pruning = [item for item in housekeeping if item["kind"] == "scratch"]
         targets = {Path(item["target"]) for item in pruning}
         allowed_targets = {home / "cache" / "scratch" for home in (self.home, self.profile)}

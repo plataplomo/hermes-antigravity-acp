@@ -12,7 +12,8 @@ from scripts.gateway_e2e import REQUIRED_STAGES
 
 class GatewayAttestationTests(unittest.TestCase):
     def receipt(self):
-        return {"schema_version": 1, "status": "PASS", "candidate_sha": "a" * 40,
+        return {"schema_version": 2, "status": "PASS", "candidate_sha": "a" * 40,
+                "boundary_refusal_reasons": [],
                 "hermes_commit": "b" * 40, "candidate_source_dirty": False,
                 "provider_origin": {"status": "PASS", "candidate_sha": "a" * 40, "tree_sha256": "3" * 64,
                                     "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
