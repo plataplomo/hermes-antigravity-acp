@@ -238,11 +238,14 @@ READY meant no request meant no prune attempt. The envelope-parity local run con
 original pruner is admitted, removes the fresh idle probe, retains the active probe and
 writes a non-empty prune log.
 
-Known diagnostic gap kept open deliberately: `cleanup()` overwrites an isolation
-`BLOCKED sticky_boundary_refusal` with the scratch FAIL detail, so the schema-1 receipt
-cannot distinguish refusals from missing pruning, and raw `gateway.log` stays inside the
-disposable root. Preserving a fixed refusal count in the receipt requires a schema change
-and is not part of this fix. The driver now fails fast with the fixed
+Known diagnostic gap (schema 1, run 43626772404): `cleanup()` overwrote an isolation
+`BLOCKED sticky_boundary_refusal` with the scratch FAIL detail, and raw `gateway.log`
+stayed inside the disposable root, so that run's single boundary refusal is unrecoverable
+from preserved evidence. Receipt schema 2 closes the gap: the driver now records
+`boundary_refusal_reasons` — the sorted unique fixed audit/provider-origin enum from both
+envelopes, never argv, paths or frames — and `validate_receipt` fails closed when the
+field is absent or the schema is stale. Identifying that refusal requires one new Hosted
+budget with the schema-2 driver. The driver now fails fast with the fixed
 `api_server_dependency_missing` detail when the interpreter lacks aiohttp, so a
 provisioning gap can never again masquerade as a Gateway startup timeout.
 
