@@ -8,29 +8,43 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from pathlib import Path
 from typing import Sequence
 
 PRUNE_BODY = ("import sys; sys.path[:] = sys.argv[3:]; "
               "import hermes_constants_scratch_detach as d; d.run(*sys.argv[1:3])")
 
-# Core e8bef69f version fingerprinting probes (issue #28 Hosted diagnosis). Verbs alone
-# are unsafe: `branch <name>`/`branch -D`, `tag <name>`/`tag -d` and `symbolic-ref <ref>
-# <target>` mutate. Admission is verb plus flag-shape, and widening it is a policy change.
-READONLY_GIT_BRANCH_FLAGS = frozenset({"-a", "-r", "-v", "-vv", "-l", "--all", "--remotes",
-                                       "--list", "--show-current", "--color", "--no-color"})
-READONLY_GIT_TAG_LIST_FLAGS = frozenset({"-l", "--list", "-n", "--contains", "--no-contains",
-                                         "--merged", "--no-merged", "--sort", "--format",
-                                         "--color", "--no-color"})
+# Core f578714 version fingerprinting probes (issue #28 Hosted diagnosis, spy runs
+# run-spy-1794678130 / run-spy-1794677408; sources hermes_cli/version_info.py,
+# hermes_cli/boot_bootstrap.py, hermes_cli/main_web_build.py, hermes_cli/plugin_catalog.py,
+# tui_gateway/git_probe.py). Verbs alone are unsafe: `branch <name>`/`branch -D`, `tag <name>`
+# /`tag -d`, `symbolic-ref <ref> <target>` mutate, and `rev-list --output=<file>` demonstrably
+# creates files inside the git child. Admission is the exact confirmed argv shape with bounded
+# validated variable parts; anything else -- unknown option, config injection, malformed argv,
+# unobserved verb -- defaults to deny. Widening any shape below is a policy change.
+GIT_OBJECT_ID = re.compile(r"[0-9a-fA-F]{7,40}")
+GIT_CATFILE_COMMIT = re.compile(r"[0-9a-fA-F]{7,40}(?:\^\{commit\})?")
+GIT_REVLIST_RANGE = re.compile(r"v[0-9]{1,16}(?:\.[0-9]{1,16}){2}\.\.HEAD")
 
 
 def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
-    """True only for read-only git probes; mutation verbs and foreign -C targets stay refused."""
+    """True only for the exact confirmed read-only git forms; every other argv is refused.
+
+    The admitted set is enumerated verb by verb below and mirrors the spy-recorded Core
+    forms. Deny is the default (no block list): a form not spelled out here is refused even
+    when the verb itself is read-only.
+    """
     if not isinstance(command, (list, tuple)) or not command:
         return False
-    if Path(os.fsdecode(command[0])).name != "git":
+    try:
+        # The observed Core probes use PATH lookup or the fixed system binary.
+        # An arbitrary executable merely named "git" is not a read-only git probe.
+        if os.fsdecode(command[0]) not in {"git", "/usr/bin/git", "/bin/git"}:
+            return False
+        args = [os.fsdecode(value) for value in command[1:]]
+    except (TypeError, ValueError):
         return False
-    args = [os.fsdecode(value) for value in command[1:]]
     no_locks = args[:1] == ["--no-optional-locks"]
     if no_locks:
         args = args[1:]
@@ -46,30 +60,41 @@ def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
     if not args:
         return False
     verb, flags = args[0], args[1:]
-    if verb in {"rev-parse", "rev-list", "describe"}:
-        return True
+    if verb == "rev-parse":
+        # version_info.py:210/256/375, boot_bootstrap.py:49, git_probe.py:38.
+        return flags in (["HEAD"], ["--short=7", "HEAD"], ["--short", "HEAD"])
+    if verb == "rev-list":
+        # version_info.py:252. --count only: --output=<file> writes, --objects/--all stream
+        # the whole object graph, and git's prefix spelling (--out) never reaches an admit.
+        return (len(flags) == 2 and flags[0] == "--count"
+                and bool(GIT_REVLIST_RANGE.fullmatch(flags[1])))
+    if verb == "describe":
+        # version_info.py:105, exact flag order and bounded --match glob.
+        return flags == ["--tags", "--long", "--match", "v2[0-9][0-9][0-9].*", "HEAD"]
+    if verb == "cat-file":
+        # main_web_build.py:64 existence probe; -e prints nothing and writes nothing.
+        # -p/--batch variants stream object payloads: not confirmed, not admitted.
+        return (len(flags) == 2 and flags[0] == "-e"
+                and bool(GIT_CATFILE_COMMIT.fullmatch(flags[1])))
     if verb == "status":
         # Without --no-optional-locks git refreshes the index, a write outside the root
         # that the in-process audit cannot observe in the git child.
-        return no_locks
-    if verb in {"log", "diff"}:
-        return not any(f == "--ext-diff" or f == "--textconv" or f.startswith("--output")
-                       for f in flags)
+        # version_info.py:226-228: --porcelain, plus -uno on the include_untracked=False path.
+        return no_locks and flags in (["--porcelain"], ["--porcelain", "-uno"])
+    if verb == "log":
+        # version_info.py:214 and plugin_catalog.py:490 use these two fixed forms.
+        return flags in (["-1", "--format=%ct", "HEAD"], ["-1", "--format=%ct", "--", "plugin-catalog"])
+    if verb == "diff":
+        # main_web_build.py:69 deleted-files listing: fixed read-only flag order, first rev
+        # an object id, tip HEAD. --ext-diff/--textconv/--output never match this shape.
+        return (len(flags) == 6
+                and flags[:4] == ["--name-only", "--no-renames", "--diff-filter=D", "-z"]
+                and (flags[4] == "HEAD" or bool(GIT_OBJECT_ID.fullmatch(flags[4])))
+                and flags[5] == "HEAD")
     if verb == "branch":
-        positional = [flag for flag in flags if not flag.startswith("-")]
-        if positional and "--list" not in flags and "-l" not in flags:
-            return False
-        return all(flag.split("=")[0] in READONLY_GIT_BRANCH_FLAGS
-                   for flag in flags if flag.startswith("-"))
+        return flags == ["--show-current"]
     if verb == "tag":
-        if not flags:
-            return True  # bare `tag` lists
-        if "--list" not in flags and "-l" not in flags:
-            return False
-        return all(flag.split("=")[0] in READONLY_GIT_TAG_LIST_FLAGS
-                   for flag in flags if flag.startswith("-"))
-    if verb == "symbolic-ref":
-        return len(args) == 2 and not args[1].startswith("-")
+        return flags == ["--merged", "HEAD", "--list", "v[0-9]*"]
     return False
 
 

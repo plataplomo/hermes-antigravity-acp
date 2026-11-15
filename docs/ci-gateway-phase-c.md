@@ -117,7 +117,7 @@ are unchanged. No skip/xfail, synthetic regression PASS or ignored failed suite 
 used. There is no extra Hosted job, diagnostic framework or direct-host fallback.
 
 Docker receipts add integer `docker_contract_version: 2` and `checkout_sha` equal
-to the executed candidate SHA. The Gateway receipt itself retains schema 1 and
+to the executed candidate SHA. The Gateway receipt itself uses schema 2 and
 all fourteen stages. CI and Release reject missing/old/wrong-typed Docker contract
 versions, conflicting checkout/candidate/Core identities, legacy `regression*`
 fields, incomplete confinement, process residue, failed owned cleanup and any
@@ -226,10 +226,11 @@ read-only git allowlist was stale against Core `e8bef69f` version fingerprinting
 `unapproved_subprocess` refusals and an isolation FAIL. The verdict moved into
 `gateway_process_policy.readonly_git_verdict` with positive/negative tests. Independent
 review proved a verb-only allowlist is unsafe (`branch -D`, `branch <name>`, `tag <name>`,
-`tag -d` all passed), so admission is verb plus flag-shape: list-only branch/tag forms,
-`status` only with `--no-optional-locks` (index refresh is an unobservable child write),
-`log`/`diff` without `--output`/`--ext-diff`/`--textconv`, single-ref `symbolic-ref`.
-Mutation verbs and foreign `-C` targets remain refused.
+`tag -d` all passed). A further regression test showed `rev-list --output` can write a
+file from the git child. The current policy admits only enumerated Core probe shapes;
+unknown options and verbs are refused. Status probes require `--no-optional-locks`,
+and no unobserved `symbolic-ref` form is admitted. This is an in-process audit policy,
+not an independently enforced kernel sandbox.
 
 `scratch_cleanup launch_count=0` is downstream of READY, not an independent defect: Core
 spawns the detached pruner only from `get_scratch_dir(prune=True)` call sites (for example
@@ -240,14 +241,14 @@ writes a non-empty prune log.
 
 Known diagnostic gap (schema 1, run 43626772404): `cleanup()` overwrote an isolation
 `BLOCKED sticky_boundary_refusal` with the scratch FAIL detail, and raw `gateway.log`
-stayed inside the disposable root, so that run's single boundary refusal is unrecoverable
-from preserved evidence. Receipt schema 2 closes the gap: the driver now records
-`boundary_refusal_reasons` — the sorted unique fixed audit/provider-origin enum from both
-envelopes, never argv, paths or frames — and `validate_receipt` fails closed when the
-field is absent or the schema is stale. Identifying that refusal requires one new Hosted
-budget with the schema-2 driver. The driver now fails fast with the fixed
+stayed inside the disposable root; the refusal's identity is unavailable. Schema 2
+records a sorted unique set of refusal strings, not occurrence counts. Run 43666846085
+recorded `subprocess_executable_mismatch`; the executable and call site were not retained.
+The successful-receipt validator now rejects any recorded refusal, missing child evidence
+or nonzero live-child count; this consistency check does not establish receipt authenticity.
+The driver fails fast with the fixed
 `api_server_dependency_missing` detail when the interpreter lacks aiohttp, so a
-provisioning gap can never again masquerade as a Gateway startup timeout.
+provisioning gap cannot masquerade as a Gateway startup timeout.
 
 ## CI gating policy
 

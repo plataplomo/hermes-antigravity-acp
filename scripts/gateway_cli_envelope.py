@@ -21,13 +21,89 @@ from gateway_process_policy import PRUNE_BODY, readonly_git_verdict, scratch_com
 from provider_origin import ProviderOrigin
 
 
+def _proc_start_time(pid: int) -> str:
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[22 - 3]
+
+
+class _ChildIdentityUnavailable(Exception):
+    """A live child has no readable /proc start identity to bind signals to."""
+
+
+class _ChildLedger:
+    """Child-process bookkeeping, separated from subprocess admission.
+
+    Admission is the audit hook's decision alone: it verifies a housekeeping
+    launch end to end and only then notes a one-shot token here. Observation is
+    the profile hook's job: a child becomes housekeeping receipt evidence only
+    by consuming a token the audit hook actually verified. Presence of
+    PRUNE_BODY or "bash" in a command never classifies a child by itself, so a
+    launch admission never verified cannot forge scratch/shutdown PASS evidence
+    into the receipt. Every admitted launch still gets start-identity tracking
+    for signal authorization and an owned-core-children.jsonl observation line.
+    """
+
+    def __init__(self, root: Path, start_time=_proc_start_time) -> None:
+        self.root = root
+        self.owned_pids: dict[int, str] = {}
+        self.owned_processes: list = []
+        self._verified_launches: list[tuple[str, tuple]] = []
+        self._start_time = start_time
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(command) -> tuple:
+        try:
+            return tuple(os.fsdecode(value) for value in command)
+        except TypeError:
+            return ()
+
+    def note_verified_launch(self, kind: str, command) -> None:
+        """Called by the audit hook only after a full housekeeping verdict passed."""
+        with self._lock:
+            self._verified_launches.append((kind, self._key(command)))
+
+    def classify(self, command) -> tuple[str, str]:
+        """Consume the matching verified token; command membership alone is never housekeeping."""
+        key = self._key(command)
+        with self._lock:
+            for index, (kind, verified) in enumerate(self._verified_launches):
+                if key and verified == key:
+                    del self._verified_launches[index]
+                    return kind, verified[5] if kind == "scratch" else ""
+        return "other", ""
+
+    def observe(self, process):
+        """Record one admitted child: start identity, verified classification, evidence line."""
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return None
+        try:
+            started = self._start_time(pid)
+        except FileNotFoundError:
+            started = None
+        kind, target = self.classify(getattr(process, "args", []))
+        if kind != "other":
+            self.owned_processes.append((kind, target, process))
+        if started is not None:
+            self.owned_pids[pid] = started
+        elif process.poll() is None:
+            raise _ChildIdentityUnavailable
+        record = {"pid": pid, "started": started, "exit_code": process.poll(), "kind": kind}
+        with (self.root / "owned-core-children.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record) + "\n")
+        return record
+
+    def housekeeping(self) -> list:
+        return [{"kind": kind, "target": target, "returncode": process.poll()}
+                for kind, target, process in self.owned_processes]
+
+
 def main() -> None:
     core, root, plugin = (Path(value).resolve(strict=True) for value in sys.argv[1:4])
     cli_argv = sys.argv[4:]
     receipt = root / ("contender-envelope.json" if os.environ.get("PHASE_C_CONTENDER") == "1" else "gateway-envelope.json")
     refused: list[str] = []
-    owned_pids: dict[int, str] = {}
-    owned_processes: list = []
+    ledger = _ChildLedger(root)
     receipt_lock = threading.RLock()
     confined = namespace_verified()
     if not confined:
@@ -107,10 +183,12 @@ def main() -> None:
                 verdict = scratch_command_verdict(str(args[0]), command, root, core, sys.executable, sys.path)
                 if verdict != "scratch_process_namespace_unverified" or not confined:
                     reject(verdict)
+                ledger.note_verified_launch("scratch", command)
                 housekeeping = True
             if name in {"timeout", "gtimeout"} and "bash" in command:
                 if not confined or not shutdown_command_verified(str(args[0]), command, core, os.getpid()):
                     reject("shutdown_diagnostic_not_verified")
+                ledger.note_verified_launch("shutdown", command)
                 housekeeping = True
             if not (is_fixture or is_readonly_git or housekeeping):
                 reject("unapproved_subprocess")
@@ -118,7 +196,7 @@ def main() -> None:
             pid, signum = args
             if pid == os.getpid():
                 return
-            expected = owned_pids.get(pid)
+            expected = ledger.owned_pids.get(pid)
             if expected is not None:
                 try:
                     current = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
@@ -145,8 +223,7 @@ def main() -> None:
                      "core_bootstrap_from_requested_source": origin == core / "hermes_bootstrap.py",
                      "provider_origin": provider_origin.receipt(),
                      "loaded_provider_sha256": sorted(factory_hashes), "client_cancel_calls": client_cancel_calls,
-                     "housekeeping": [{"kind": kind, "target": target, "returncode": process.poll()}
-                                      for kind, target, process in owned_processes]}
+                     "housekeeping": ledger.housekeeping()}
             temporary = receipt.with_suffix(".tmp")
             temporary.write_text(json.dumps(value), encoding="utf-8")
             temporary.replace(receipt)
@@ -166,23 +243,10 @@ def main() -> None:
             finish()
         elif (event == "return" and frame.f_code.co_name == "__init__"
               and frame.f_globals.get("__name__") == "subprocess"):
-            process = frame.f_locals.get("self")
-            pid = getattr(process, "pid", None)
-            if isinstance(pid, int):
-                try:
-                    started = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[22-3]
-                except FileNotFoundError:
-                    started = None
-                command = getattr(process, "args", [])
-                kind = "scratch" if PRUNE_BODY in command else "shutdown" if "bash" in command else "other"
-                if kind != "other":
-                    owned_processes.append((kind, str(command[5]) if kind == "scratch" else "", process))
-                if started is not None:
-                    owned_pids[pid] = started
-                elif process.poll() is None:
-                    reject("owned_child_identity_unavailable")
-                with (root / "owned-core-children.jsonl").open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"pid": pid, "started": started, "exit_code": process.poll(), "kind": kind}) + "\n")
+            try:
+                ledger.observe(frame.f_locals.get("self"))
+            except _ChildIdentityUnavailable:
+                reject("owned_child_identity_unavailable")
         elif event == "c_call" and arg is os._exit:
             finish()
 

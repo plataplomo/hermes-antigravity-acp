@@ -14,6 +14,7 @@ class GatewayAttestationTests(unittest.TestCase):
     def receipt(self):
         return {"schema_version": 2, "status": "PASS", "candidate_sha": "a" * 40,
                 "boundary_refusal_reasons": [],
+                "owned_child_count": 2, "live_owned_children_after_exit": 0,
                 "hermes_commit": "b" * 40, "candidate_source_dirty": False,
                 "provider_origin": {"status": "PASS", "candidate_sha": "a" * 40, "tree_sha256": "3" * 64,
                                     "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
@@ -56,6 +57,49 @@ class GatewayAttestationTests(unittest.TestCase):
         self.assertEqual([], attest.check_outputs({"gateway_result": "skipped", "gateway_record": ""}, required=False))
         self.assertTrue(attest.check_outputs({}, required=False))
         self.assertTrue(attest.check_outputs({"gateway_result": "failure"}, required=False))
+
+    def test_refusal_and_residual_child_contradictions_never_attest(self):
+        for key, value in (("boundary_refusal_reasons", ["unapproved_subprocess"]),
+                           ("live_owned_children_after_exit", 3),
+                           ("live_owned_children_after_exit", -1),
+                           ("live_owned_children_after_exit", True),
+                           ("live_owned_children_after_exit", "0"),
+                           ("owned_child_count", 0),
+                           ("owned_child_count", -2),
+                           ("owned_child_count", False)):
+            with self.subTest(key=key, value=value):
+                receipt = self.receipt()
+                receipt[key] = value
+                outputs = self.outputs()
+                outputs["gateway_record"] = json.dumps(receipt)
+                self.assertTrue(attest.check_outputs(outputs, required=True, candidate="a" * 40))
+
+    def test_preserved_red_cases_reject_both_validator_and_attestation(self):
+        # The historical four-case reproducer imports immutable old schema-2 and
+        # abandoned schema-3 code. Test both contradictions at both CURRENT gates.
+        for key, value in (("boundary_refusal_reasons", ["subprocess_executable_mismatch"]),
+                           ("live_owned_children_after_exit", 3)):
+            for gate in ("validator", "attestation"):
+                with self.subTest(key=key, gate=gate):
+                    receipt = self.receipt()
+                    receipt[key] = value
+                    if gate == "validator":
+                        from scripts.gateway_e2e import validate_receipt
+                        errors = validate_receipt(receipt, "a" * 40)
+                    else:
+                        outputs = self.outputs()
+                        outputs["gateway_record"] = json.dumps(receipt)
+                        errors = attest.check_outputs(outputs, required=True, candidate="a" * 40)
+                    self.assertTrue(errors)
+
+    def test_missing_child_count_evidence_never_attests(self):
+        for key in ("live_owned_children_after_exit", "owned_child_count"):
+            with self.subTest(key=key):
+                receipt = self.receipt()
+                del receipt[key]
+                outputs = self.outputs()
+                outputs["gateway_record"] = json.dumps(receipt)
+                self.assertTrue(attest.check_outputs(outputs, required=True, candidate="a" * 40))
 
 
 if __name__ == "__main__":

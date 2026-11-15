@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 
 from scripts.gateway_process_policy import (PRUNE_BODY, canonical_owned_path, readonly_git_verdict,
                                             scratch_command_verdict)
+
+# The exact object id from the issue #28 Hosted spy (run-spy-1794678130).
+SPY_SHA = "e8bef69f505554154c158aed0a27c429c11791c0"
 
 
 class ScratchAdmissionTests(unittest.TestCase):
@@ -70,7 +75,13 @@ class ScratchAdmissionTests(unittest.TestCase):
 
 
 class ReadonlyGitAdmissionTests(unittest.TestCase):
-    """Core e8bef69f version fingerprinting probes read the fixture checkout only."""
+    """Core f578714 version fingerprinting probes read the fixture checkout only.
+
+    Admitted forms are the exact argv shapes recorded by the issue #28 Hosted spy
+    (diag run-spy-1794678130 / run-spy-1794677408) and their source call sites:
+    hermes_cli/version_info.py, hermes_cli/boot_bootstrap.py, hermes_cli/main_web_build.py,
+    hermes_cli/plugin_catalog.py, tui_gateway/git_probe.py. Everything else defaults to deny.
+    """
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="gw-git-policy-")
@@ -87,8 +98,26 @@ class ReadonlyGitAdmissionTests(unittest.TestCase):
                         ["git", "log", "-1", "--format=%ct", "HEAD"],
                         ["git", "diff", "--name-only", "--no-renames", "--diff-filter=D", "-z",
                          "e8bef69f", "HEAD"],
-                        ["git", "symbolic-ref", "HEAD"], ["git", "describe", "--tags"],
-                        ["git", "tag"]):
+                        ["git", "describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*",
+                         "HEAD"]):
+            with self.subTest(command=command):
+                self.assertTrue(readonly_git_verdict(command, self.core))
+
+    def test_spy_recorded_gateway_forms_are_admitted(self):
+        # Exact argv from spy-popens.jsonl run-spy-1794678130 / run-spy-1794677408 plus the
+        # source-verified gateway fallbacks (git_probe detached HEAD, plugin_catalog sweep,
+        # version_info include_untracked status, write-free main_desktop rev-parse).
+        system_git = shutil.which("git") or "/usr/bin/git"
+        for command in (["git", "-C", str(self.core), "cat-file", "-e", f"{SPY_SHA}^{{commit}}"],
+                        [system_git, "-C", str(self.core), "rev-parse", "HEAD"],
+                        ["git", "-C", str(self.core), "diff", "--name-only", "--no-renames",
+                         "--diff-filter=D", "-z", SPY_SHA, "HEAD"],
+                        ["git", "rev-parse", "--short=7", "HEAD"],
+                        ["git", "-C", str(self.core), "rev-parse", "--short", "HEAD"],
+                        ["git", "--no-optional-locks", "status", "--porcelain"],
+                        ["git", "-C", str(self.core), "log", "-1", "--format=%ct", "--",
+                         "plugin-catalog"],
+                        ["git", "rev-parse", "HEAD"]):
             with self.subTest(command=command):
                 self.assertTrue(readonly_git_verdict(command, self.core))
 
@@ -96,7 +125,8 @@ class ReadonlyGitAdmissionTests(unittest.TestCase):
         for command in (["git"], ["git", "commit", "-m", "x"], ["git", "checkout", "main"],
                         ["git", "-C", str(self.core.parent), "status"], ["git", "-C", str(self.core)],
                         ["git", "--no-optional-locks"], ["git", "-c", "user.name=x", "commit"],
-                        ["python", "status"], [], "git status",
+                        ["python", "status"], [str(self.core / "git"), "rev-parse", "HEAD"],
+                        ["./git", "rev-parse", "HEAD"], [], "git status",
                         ["git", "branch", "-D", "main"], ["git", "branch", "new-branch"],
                         ["git", "branch", "-m", "old", "new"], ["git", "tag", "v1.0"],
                         ["git", "tag", "-d", "v1.0"], ["git", "tag", "-a", "-m", "x", "v1"],
@@ -108,6 +138,138 @@ class ReadonlyGitAdmissionTests(unittest.TestCase):
                         "/etc", "status"]):
             with self.subTest(command=command):
                 self.assertFalse(readonly_git_verdict(command, self.core))
+
+    def test_write_capable_and_unknown_option_forms_default_denied(self):
+        # Deny is the default for any argv not enumerated above; these are the write-capable
+        # or unknown-option neighbours of admitted verbs, not a block list.
+        for command in (["git", "rev-list", "--count", "--output=/tmp/leak", "HEAD"],
+                        ["git", "-C", str(self.core), "rev-list", "--count", "--out", "/tmp/leak",
+                         "HEAD"],  # git's unambiguous-prefix spelling of --output
+                        ["git", "rev-list", "--count"], ["git", "rev-list", "--objects", "HEAD"],
+                        ["git", "rev-list", "--all"], ["git", "rev-list", "--count", "-output"],
+                        ["git", "rev-list", "--count", "--", "v1..HEAD"],
+                        ["git", "rev-list", "--count", "-x..HEAD"],
+                        ["git", "rev-list", "--count", "v" + "0" * 200 + "..HEAD"],
+                        ["git", "rev-parse", "--git-dir"], ["git", "rev-parse", "--show-toplevel"],
+                        ["git", "rev-parse", "--revs-only", "--all"],
+                        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                        ["git", "rev-parse", "--short=99", "HEAD"],
+                        ["git", "rev-parse", "HEAD", "extra"], ["git", "rev-parse"],
+                        ["git", "describe", "--broken"], ["git", "describe", "--tags"],
+                        ["git", "describe", "--tags", "--long", "--match", "v2[0-9][0-9][0-9].*"],
+                        ["git", "describe", "--match", "x", "--tags", "--long", "HEAD"],
+                        ["git", "describe", "--tags", "--long", "--match", ";rm -rf /", "HEAD"],
+                        ["git", "cat-file", "-p", "HEAD"], ["git", "cat-file", "--batch", "HEAD"],
+                        ["git", "cat-file", "--batch-all-objects", "-e", SPY_SHA],
+                        ["git", "cat-file", "-e"], ["git", "cat-file", "-e", "HEAD"],
+                        ["git", "cat-file", "-e", "--output=/tmp/leak"],
+                        ["git", "cat-file", "-e", SPY_SHA + "z"],
+                        ["git", "cat-file", "-e", "abc12"],  # below git's 7-char minimum
+                        ["git", "cat-file", "-e", SPY_SHA + "^{tree}"],
+                        ["git", "cat-file", "-e", "refs/tags/v1^{commit}"],
+                        ["git", "log", "-1", "--format=%H", "HEAD"],
+                        ["git", "log", "-2", "--format=%ct", "HEAD"],
+                        ["git", "log", "--format=%ct", "HEAD"],
+                        ["git", "log", "-1", "--format=%ct", "--", "../../etc/passwd"],
+                        ["git", "log", "-1", "--format=%ct", "--", "-output"],
+                        ["git", "log", "-1", "--format=%ct", "--", "a/../b"],
+                        ["git", "diff", "--name-only", "--no-renames", "--diff-filter=AMD", "-z",
+                         SPY_SHA, "HEAD"],
+                        ["git", "diff", "--name-only", "--no-renames", "--diff-filter=D", "-z",
+                         "main", "HEAD"],
+                        ["git", "diff", "--name-only", "--no-renames", "--diff-filter=D", "-z",
+                         "HEAD"],
+                        ["git", "diff", "--name-only", "--no-renames", "--diff-filter=D", "-z",
+                         SPY_SHA, "HEAD", "extra"],
+                        ["git", "--no-optional-locks", "status", "--ignored"],
+                        ["git", "--no-optional-locks", "status", "--porcelain", "-uall"],
+                        ["git", "--no-optional-locks", "status", "--porcelain", "-uno", "extra"]):
+            with self.subTest(command=command):
+                self.assertFalse(readonly_git_verdict(command, self.core))
+
+    def test_config_injection_and_ambiguous_forms_denied(self):
+        # -c/--config can rewrite diff/pager/external behaviour; abbreviated long options let
+        # git resolve a spelling the policy never admitted to a write-capable long option.
+        for command in (["git", "-c", "core.pager=cat", "rev-parse", "HEAD"],
+                        ["git", "-c", "diff.external=/bin/touch", "diff", "--name-only",
+                         "--no-renames", "--diff-filter=D", "-z", SPY_SHA, "HEAD"],
+                        ["git", "--no-optional-locks", "-c", "x.y=z", "status", "--porcelain"],
+                        ["git", "-C", str(self.core), "-c", "protocol.ext.allow=always", "fetch"],
+                        ["git", "config", "--get", "user.name"],
+                        ["git", "config", "user.name", "x"],
+                        ["git", "--config", "core.fsmonitor=false", "status"],
+                        ["git", "rev-list", "--count", "--output", "/tmp/leak", "HEAD"]):
+            with self.subTest(command=command):
+                self.assertFalse(readonly_git_verdict(command, self.core))
+
+    def test_unobserved_verbs_default_denied(self):
+        # Present in Core sources but never in the fixture spy: admission is a deliberate,
+        # evidence-backed widening, never a side effect of a neighbouring verb.
+        for command in (["git", "show", "v1.0:pyproject.toml"],
+                        ["git", "symbolic-ref", "HEAD"], ["git", "tag"],
+                        ["git", "branch", "--list"], ["git", "tag", "--list"],
+                        ["git", "rev-parse", "--show-cdup"], ["git", "fetch", "origin"],
+                        ["git", "push"], ["git", "gc"], ["git", "maintenance", "run"],
+                        ["git", "clean", "-n"], ["git", "stash"], ["git", "worktree", "list"],
+                        ["git", "ls-files"], ["git", "cat-file", "-t", SPY_SHA]):
+            with self.subTest(command=command):
+                self.assertFalse(readonly_git_verdict(command, self.core))
+
+    def test_malformed_argv_never_admitted(self):
+        for command in (["git", 5], ["git", None], ["git", ""], ["git", "-C", 5, "rev-parse",
+                                                                "HEAD"],
+                        ["git", b"\xff\xfe"], ["git", "-C", str(self.core), 5]):
+            with self.subTest(command=command):
+                self.assertFalse(readonly_git_verdict(command, self.core))
+
+
+@unittest.skipIf(shutil.which("git") is None, "git binary required for write ground truth")
+class GitOutputRedirectWriteTests(unittest.TestCase):
+    """`--output=<file>` is a real write performed inside the git child, invisible to the
+    in-process audit. The policy must refuse these forms and stay refused: this test proves
+    the refused argv genuinely creates a file, so no future widening can re-admit it blindly."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="gw-git-write-")
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name).resolve() / "repo"
+        self.repo.mkdir()
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        for probe in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "seed"]):
+            subprocess.run(["git", "-C", str(self.repo), *probe], env=env, check=True,
+                           capture_output=True)
+        self.commit = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+
+    def assert_refused_and_actually_writes(self, argv, out):
+        self.assertFalse(readonly_git_verdict(argv, self.repo), argv)
+        subprocess.run(argv, check=True, capture_output=True)  # ground truth, confined to temp
+        self.assertTrue(out.exists(), f"{argv} did not create {out.name}")
+
+    def test_rev_list_original_output_redirect_writes_file_and_is_refused(self):
+        out = self.repo / "rev-list-original.leak"
+        out.write_text("sentinel", encoding="utf-8")
+        argv = ["git", "-C", str(self.repo), "rev-list", f"--output={out}", "HEAD"]
+        self.assertFalse(readonly_git_verdict(argv, self.repo))
+        subprocess.run(argv, check=True, capture_output=True)
+        self.assertNotEqual("sentinel", out.read_text(encoding="utf-8"))
+
+    def test_rev_list_output_redirect_writes_file_and_is_refused(self):
+        out = self.repo / "rev-list.leak"
+        self.assert_refused_and_actually_writes(
+            ["git", "-C", str(self.repo), "rev-list", "--count", f"--output={out}", "HEAD"], out)
+
+    def test_log_output_redirect_writes_file_and_is_refused(self):
+        out = self.repo / "log.leak"
+        self.assert_refused_and_actually_writes(
+            ["git", "-C", str(self.repo), "log", f"--output={out}", "-1", "HEAD"], out)
+
+    def test_diff_output_redirect_writes_file_and_is_refused(self):
+        out = self.repo / "diff.leak"
+        self.assert_refused_and_actually_writes(
+            ["git", "-C", str(self.repo), "diff", f"--output={out}", "--name-only",
+             self.commit, "HEAD"], out)
 
 
 if __name__ == "__main__":
