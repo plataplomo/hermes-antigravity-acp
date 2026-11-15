@@ -82,6 +82,17 @@ def test_systemctl_status_exact_commands_and_context(tmp_path, command):
                 kw.get('executable', 'systemctl'), c, kw.get('cwd', root), e, root,
                 kw.get('confined', True), baseline=b)
         assert check()
+        # The official Core gateway module appends these exact missing system dirs
+        # at import time; the resolved executable must still be pinned below.
+        core_path = env['PATH'] + ':/sbin:/usr/sbin'
+        assert check(e={**env, 'PATH': core_path})
+        assert not check(e={**env, 'PATH': '/attacker:' + core_path})
+        assert not check(e={**env, 'PATH': env['PATH'] + ':/usr/sbin:/sbin'})
+        assert not check(e={**env, 'PATH': core_path + ':/attacker'})
+        for unsafe in (':/usr/bin:/bin', '/usr/bin::/bin', '/usr/bin:/bin:', 'relative:/usr/bin:/bin',
+                       f'{runtime}:/usr/bin:/bin'):
+            poisoned = {**env, 'PATH': unsafe}
+            assert not check(e=poisoned, b=poisoned)
         for verb in ('start', 'stop', 'restart', 'daemon-reload', 'enable', 'reset-failed', 'show', 'is-active'):
             assert not check(['systemctl', verb])
         for option in ('--host=elsewhere', '--machine=x', '--root=/', '--no-pager'):
