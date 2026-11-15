@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Sequence
 
@@ -96,6 +97,339 @@ def readonly_git_verdict(command: Sequence[str], core: Path) -> bool:
     if verb == "tag":
         return flags == ["--merged", "HEAD", "--list", "v[0-9]*"]
     return False
+
+
+# A read-only argv does not make the git *process* read-only. git selects its repository
+# from the launch cwd, resolves helpers through PATH and GIT_EXEC_PATH, and can exec
+# external programs from inherited configuration -- none of which argv spelling constrains.
+# The envelope's audit hook sees all three only as Popen arguments, so admission pins the
+# launch context too. Reproduced against real git in evidence/probe_admitted_git_vectors.py:
+# a PATH swap runs a foreign binary, GIT_TRACE writes a file, and a hostile repository chosen
+# by the Popen cwd alone executes core.fsmonitor -- all under argv the shape policy admits.
+# Core's version_info.py:63 probes pass cwd= with no -C, so cwd is the only repo selector.
+GIT_SYSTEM_EXECUTABLES = ("/usr/bin/git", "/bin/git")
+
+# git settings that name a program or hook to run. The values are the inert spellings Core's
+# own noninteractive_git_env() produces (_subprocess_compat.py:289-303); the same key with
+# any other value is an execution channel. Keys are lower-cased (git folds them); values are
+# compared exactly, because git does NOT fold configuration values.
+GIT_EXEC_CAPABLE_CONFIG = {
+    "credential.helper": frozenset({""}),
+    "core.askpass": frozenset({""}),
+    "core.fsmonitor": frozenset({"false", ""}),
+    "core.hookspath": frozenset({os.devnull, "/dev/null"}),
+    "core.pager": frozenset({"cat"}),
+    "core.editor": frozenset({"true"}),
+    "sequence.editor": frozenset({"true"}),
+    "diff.external": frozenset({""}),
+    "core.sshcommand": frozenset({"ssh -o BatchMode=yes"}),
+}
+GIT_EXEC_CAPABLE_CONFIG_PREFIXES = ("filter.", "alias.", "difftool.", "mergetool.",
+                                    "credential.", "pager.")
+GIT_EXEC_CAPABLE_CONFIG_SUFFIXES = (".process", ".clean", ".smudge", ".textconv",
+                                    ".command", ".hookpath")
+GIT_EXEC_CAPABLE_CONFIG_KEYS = frozenset({"core.attributesfile"})
+# git config directives that pull further files into the effective configuration. The include
+# graph is not modelled here, so a config that widens itself is not admitted: reproduced with
+# real git, `[include] path=<file>` (and the GIT_CONFIG_KEY_0=include.path injection form)
+# loads a second file whose core.fsmonitor git then execs, while a scan of the first file
+# alone sees nothing executable.
+GIT_INCLUDE_PATH_KEY = "include.path"
+GIT_INCLUDE_IF_PREFIX = "includeif."
+GIT_CONFIG_SECTION = re.compile(r'^([^\s"\]]+)(?:\s+"([^"]*)")?\s*$')
+
+# Variables that relocate the repository or redirect git's config lookup outright.
+GIT_RELOCATING_ENV = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG_PARAMETERS",
+    "GIT_ATTR_SOURCE", "GIT_CEILING_DIRECTORIES", "GIT_SHELL",
+})
+# Config-channel variables, admitted only in the inert form Core itself sets.
+GIT_CONFIG_ENV = {
+    "GIT_CONFIG_GLOBAL": frozenset({os.devnull, "/dev/null"}),
+    "GIT_CONFIG_SYSTEM": frozenset({os.devnull, "/dev/null"}),
+    "GIT_CONFIG_NOSYSTEM": frozenset({"1"}),
+}
+# Program-selection and behaviour variables, admitted only at Core's own values.
+GIT_PROGRAM_ENV = {
+    "GIT_PAGER": frozenset({"cat"}), "PAGER": frozenset({"cat"}),
+    "GIT_EDITOR": frozenset({"true"}), "GIT_SEQUENCE_EDITOR": frozenset({"true"}),
+}
+GIT_INERT_ENV = {
+    "GIT_TERMINAL_PROMPT": frozenset({"0"}), "GCM_INTERACTIVE": frozenset({"Never"}),
+    "GIT_NO_LAZY_FETCH": frozenset({"1"}), "GIT_OPTIONAL_LOCKS": frozenset({"0", "1"}),
+    "GIT_ATTR_NOSYSTEM": frozenset({"1"}),
+}
+GIT_CONFIG_INJECT_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+# Structural members of the config-injection block: validated as a set, not by value table.
+GIT_STRUCTURAL_ENV = frozenset({"GIT_CONFIG_COUNT"})
+# Everything a probe may legitimately add or change. Any other variable it introduces is an
+# unverified execution or relocation channel -- reproduced: LD_PRELOAD, LD_LIBRARY_PATH,
+# EDITOR and SSH_ASKPASS all reached an admitted git child under a name-scoped screen.
+GIT_PROBE_ENV = {**GIT_CONFIG_ENV, **GIT_PROGRAM_ENV, **GIT_INERT_ENV}
+# The only git config keys the GIT_CONFIG_KEY_n channel may carry: Core's hardening overrides
+# (_subprocess_compat.py:289-303) plus the safe.directory replay it appends. Deny by default,
+# so an injected key cannot lean on "not known to be dangerous".
+GIT_CONFIG_OVERRIDE_KEYS = frozenset(GIT_EXEC_CAPABLE_CONFIG) | {"core.untrackedcache",
+                                                                 "safe.directory"}
+# The environment the envelope process was launched with. The policed Gateway runs in-process
+# and can mutate os.environ freely -- CPython emits no audit event for that -- so the diff that
+# decides what a probe *changed* must be taken against this snapshot. Reproduced: with the
+# baseline read live, `os.environ["GIT_DIR"] = ...` followed by a probe that inherits the
+# environment produced an admit, while the same GIT_DIR passed explicitly was refused.
+BASELINE_ENV: dict = dict(os.environ)
+
+
+def _config_pair_verdict(env: dict) -> str:
+    """Validate the GIT_CONFIG_COUNT block: Core's hardening replay channel, nothing else."""
+    names = [name for name in env if name.startswith(GIT_CONFIG_INJECT_PREFIXES)]
+    if not names:
+        return "" if "GIT_CONFIG_COUNT" not in env else "git_config_injection"
+    try:
+        count = int(env["GIT_CONFIG_COUNT"])
+    except (KeyError, ValueError):
+        return "git_config_injection"
+    if not 0 <= count <= 64:
+        return "git_config_injection"
+    pairs = {}
+    for name in names:
+        prefix, _, suffix = name.rpartition("_")
+        try:
+            index = int(suffix)
+        except ValueError:
+            return "git_config_injection"
+        if prefix not in {"GIT_CONFIG_KEY", "GIT_CONFIG_VALUE"} or not 0 <= index < count:
+            return "git_config_injection"
+        pairs.setdefault(index, {})[prefix] = env[name]
+    if len(pairs) != count or any(set(pair) != {"GIT_CONFIG_KEY", "GIT_CONFIG_VALUE"}
+                                  for pair in pairs.values()):
+        return "git_config_injection"
+    for pair in pairs.values():
+        name = pair["GIT_CONFIG_KEY"].strip().lower()
+        value = pair["GIT_CONFIG_VALUE"].strip().strip('"')
+        if name not in GIT_CONFIG_OVERRIDE_KEYS:
+            return "git_config_injection"
+        if name not in GIT_EXEC_CAPABLE_CONFIG:
+            continue  # safe.directory / core.untrackedcache: admitted, and not an exec channel
+        if value not in GIT_EXEC_CAPABLE_CONFIG[name]:
+            return "git_config_injection"
+    return ""
+
+
+def _config_section_header(body: str) -> str | None:
+    """Normalise a git section header body, or None when git itself would reject it."""
+    match = GIT_CONFIG_SECTION.match(body.strip())
+    if match is None:
+        return None
+    section = match.group(1).lower()
+    subsection = match.group(2)
+    return f"{section}.{subsection.lower()}" if subsection else section
+
+
+def _config_text_exec_capable(text: str) -> bool:
+    """True when git config text names a program/hook git would run, in a non-inert value."""
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            # git accepts a comment after the closing bracket, so the header ends at the
+            # first ']' and the remainder of the line is not part of the section name.
+            end = line.find("]")
+            parsed = _config_section_header(line[1:end]) if end > 0 else None
+            if parsed is None:
+                return True  # git rejects this file too; refuse rather than guess a section
+            section = parsed
+            continue
+        if "=" not in line:
+            continue
+        option, _, value = line.partition("=")
+        name = f"{section}.{option.strip().lower()}"
+        value = value.strip().strip('"')
+        if _config_key_widens_or_executes(name):
+            if name not in GIT_EXEC_CAPABLE_CONFIG or value not in GIT_EXEC_CAPABLE_CONFIG[name]:
+                return True
+    return False
+
+
+def _config_key_widens_or_executes(name: str) -> bool:
+    """True for a config key that runs a program or silently widens the effective config."""
+    if name in GIT_EXEC_CAPABLE_CONFIG or name in GIT_EXEC_CAPABLE_CONFIG_KEYS:
+        return True
+    if name.startswith(GIT_EXEC_CAPABLE_CONFIG_PREFIXES):
+        return True
+    if name.endswith(GIT_EXEC_CAPABLE_CONFIG_SUFFIXES):
+        return True
+    return (name == GIT_INCLUDE_PATH_KEY
+            or (name.startswith(GIT_INCLUDE_IF_PREFIX) and name.endswith(".path")))
+
+
+def _config_file_exec_capable(path: Path) -> bool:
+    """An unreadable config file is treated as capable: it cannot be cleared, so it is not admitted."""
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        return _config_text_exec_capable(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, UnicodeError):
+        return True
+
+
+def _repo_config_paths(repo: Path) -> list | None:
+    """The repository-level config files git will load, following a worktree `gitdir:` pointer.
+
+    A linked worktree has no config of its own. git loads `<commondir>/config`, where the
+    common directory is named by the `commondir` file inside the worktree gitdir, plus
+    `<gitdir>/config.worktree` when extensions.worktreeConfig is enabled. Reproduced: scanning
+    only `<gitdir>/config` — a file that does not exist for a linked worktree — admitted a
+    probe whose common config carried `core.fsmonitor`, and real git executed it. All three
+    spellings are scanned rather than probing the extension, so the set is a superset of what
+    git will read and a missing file is simply inert.
+    """
+    git_dir = repo / ".git"
+    try:
+        if git_dir.is_file():
+            text = git_dir.read_text(encoding="utf-8", errors="replace").strip()
+            if not text.startswith("gitdir:"):
+                return None
+            target = Path(text.split(":", 1)[1].strip())
+            git_dir = target if target.is_absolute() else (repo / target).resolve()
+    except (OSError, UnicodeError):
+        return None
+    paths = [git_dir / "config", git_dir / "config.worktree"]
+    try:
+        common = git_dir / "commondir"
+        if common.is_file():
+            value = common.read_text(encoding="utf-8", errors="replace").strip()
+            if not value:
+                return None
+            target = Path(value)
+            common_dir = target if target.is_absolute() else (git_dir / target).resolve()
+            paths.append(common_dir / "config")
+    except (OSError, UnicodeError):
+        return None
+    return paths
+
+
+def _effective_config_exec_capable(child: dict, repo: Path) -> bool:
+    """Every config file the admitted git child will actually load, not just the repo's.
+
+    Reproduced: with the container's writable fixture HOME and an inherited environment, a
+    planted ~/.gitconfig carrying core.fsmonitor makes the admitted read-only
+    `--no-optional-locks status --porcelain` execute an external program. Pinning
+    GIT_CONFIG_GLOBAL to the null device is what keeps Core's own probes out of this path, so
+    the files are only consulted when the child does not pin them away.
+    """
+    candidates = []
+    repo_configs = _repo_config_paths(repo)
+    if repo_configs is None:
+        return True
+    candidates.extend(repo_configs)
+    if child.get("GIT_CONFIG_GLOBAL") not in (os.devnull, "/dev/null"):
+        # HOME and XDG_CONFIG_HOME are already required to equal the baseline, so the child's
+        # own values are the ones git will use; the live os.environ is not a trustworthy read.
+        home = Path(child.get("HOME") or "/nonexistent")
+        candidates.append(home / ".gitconfig")
+        candidates.append(Path(child.get("XDG_CONFIG_HOME") or home / ".config") / "git" / "config")
+    system = child.get("GIT_CONFIG_SYSTEM") or None
+    if child.get("GIT_CONFIG_NOSYSTEM") != "1":
+        candidates.append(Path(system) if system not in (None, os.devnull, "/dev/null")
+                          else Path("/etc/gitconfig"))
+    return any(_config_file_exec_capable(path) for path in candidates)
+
+
+def _system_git_realpaths() -> frozenset:
+    paths = set()
+    for candidate in GIT_SYSTEM_EXECUTABLES:
+        try:
+            paths.add(Path(candidate).resolve(strict=True))
+        except OSError:
+            continue
+    return frozenset(paths)
+
+
+SYSTEM_GIT_REALPATHS = _system_git_realpaths()
+
+
+def git_probe_context_verdict(command: Sequence[str], core: Path, cwd, env,
+                              baseline: dict | None = None) -> str:
+    """Return "" when an argv-admitted git probe is also safe to launch; else a fixed reason.
+
+    `readonly_git_verdict` proves the argv shape. It cannot see which binary PATH resolves,
+    which repository the launch cwd selects, or which configuration and helpers the child
+    inherits -- and git takes writes and external program execution from all three. This is
+    the other half of the same admission decision, not a separate framework: every check
+    below closes one reproduced channel, and unknown values deny by default.
+
+    `baseline` is the environment the envelope was launched with (`BASELINE_ENV` by default).
+    It is not read from live `os.environ`: the policed Gateway shares this process and can
+    rewrite `os.environ` with no audit event at all.
+    """
+    if not isinstance(command, (list, tuple)) or not command:
+        return "git_argv_unreadable"
+    if env is not None and (not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in env.items())):
+        return "git_environment_unreadable"
+    child = dict(os.environ) if env is None else env
+    ambient = BASELINE_ENV if baseline is None else baseline
+    changed = {name: value for name, value in child.items() if ambient.get(name) != value}
+    # PATH and identity are what select the binary and the user's ~/.gitconfig. They are
+    # never a probe parameter, in either direction.
+    for name, reason in (("PATH", "git_path_overridden"),
+                         ("HOME", "git_home_overridden"),
+                         ("XDG_CONFIG_HOME", "git_home_overridden")):
+        if child.get(name) != ambient.get(name):
+            return reason
+    if any(name.startswith("GIT_TRACE") for name in changed):
+        return "git_trace_enabled"
+    if "GIT_EXEC_PATH" in changed:
+        return "git_exec_path_overridden"
+    if GIT_RELOCATING_ENV & set(changed):
+        return "git_config_injection"
+    for name, allowed in GIT_CONFIG_ENV.items():
+        if name in changed and child[name] not in allowed:
+            return "git_config_injection"
+    verdict = _config_pair_verdict({name: child[name] for name in changed})
+    if verdict:
+        return verdict
+    # Deny by default over everything the probe introduced: a variable that merely exists in
+    # the baseline is the driver's choice, one the caller adds or edits is not. Screening only
+    # GIT_* names let LD_PRELOAD, LD_LIBRARY_PATH, EDITOR and SSH_ASKPASS reach the child.
+    for name in changed:
+        if name.startswith(GIT_CONFIG_INJECT_PREFIXES) or name in GIT_STRUCTURAL_ENV:
+            continue  # validated as a block by _config_pair_verdict above
+        allowed = GIT_PROBE_ENV.get(name)
+        if allowed is None or child[name] not in allowed:
+            return "git_environment_override_unverified"
+    # Dropping a git-relevant variable is an edit too (it re-enables a default git would use).
+    if any(name not in child for name in ambient
+           if name.startswith("GIT_") or name in GIT_PROBE_ENV):
+        return "git_environment_override_unverified"
+    try:
+        argv0 = os.fsdecode(command[0])
+        resolved = argv0 if "/" in argv0 else shutil.which(argv0)
+        if resolved is None:
+            return "git_executable_untrusted"
+        executable = Path(resolved).resolve(strict=True)
+        stat = executable.stat()
+    except (OSError, TypeError, ValueError):
+        return "git_executable_untrusted"
+    if executable not in SYSTEM_GIT_REALPATHS or stat.st_uid == os.getuid() \
+            or stat.st_mode & 0o022:
+        return "git_executable_untrusted"
+    args = [os.fsdecode(value) for value in command[1:]]
+    target = os.getcwd() if cwd is None else os.fsdecode(cwd)
+    if args[:1] == ["-C"] and len(args) > 1:
+        target = args[1]
+    try:
+        if Path(target).resolve(strict=True) != core.resolve(strict=True):
+            return "git_probe_repo_unpinned"
+        repo = Path(target).resolve(strict=True)
+    except (OSError, TypeError, ValueError):
+        return "git_probe_repo_unpinned"
+    if _effective_config_exec_capable(child, repo):
+        return "git_effective_config_exec_capable"
+    return ""
 
 
 def canonical_owned_path(value: str, root: Path) -> Path | None:

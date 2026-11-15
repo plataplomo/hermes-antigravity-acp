@@ -232,6 +232,56 @@ unknown options and verbs are refused. Status probes require `--no-optional-lock
 and no unobserved `symbolic-ref` form is admitted. This is an in-process audit policy,
 not an independently enforced kernel sandbox.
 
+Argv shape alone cannot make the git *process* read-only, and a follow-up review confirmed
+three reproductions against real git under shapes the allowlist admits: a `PATH` swap runs a
+foreign binary named `git`, `GIT_TRACE`/`GIT_TRACE2_EVENT` write a file from an otherwise
+read-only probe, and a hostile repository selected only by the `Popen` cwd executes
+`core.fsmonitor`. Core's own version fingerprinting passes `cwd=str(repo_dir)` with no `-C`
+(`version_info.py:64`), so the launch cwd is the only thing selecting that repository, and the
+audit hook sees cwd and environment only as `Popen` arguments. `git_probe_context_verdict`
+therefore pins the launch context alongside the shape: the resolved executable must be the
+system git and unwritable by the running uid, `PATH`/`HOME`/`XDG_CONFIG_HOME` may not change,
+`GIT_TRACE*`/`GIT_EXEC_PATH`/repository-relocating variables are refused, the
+`GIT_CONFIG_KEY_n` block must equal Core's own hardening overrides, and the effective
+repository (explicit `-C`, else the launch cwd) must be the pinned Core checkout. Every config
+file the child will actually load — the checkout's own, plus `$HOME/.gitconfig` and
+`$XDG_CONFIG_HOME/git/config` and the system file unless the child pins them to the null
+device — must carry no execution-capable setting, and no `include`/`includeIf` directive, since
+git folds the included file into its effective configuration and a scan of the first file alone
+would see nothing executable. That config rule closes a reproduction the first review left as a
+residual risk: the container's fixture `HOME` lives under `/gw`, the
+only writable mount, so a planted `~/.gitconfig` carrying `core.fsmonitor` made the admitted
+read-only `--no-optional-locks status --porcelain` execute an external program. A second review
+round closed six more reproductions, all of them gaps in that same screen rather than new
+subsystems: `LD_PRELOAD`, `LD_LIBRARY_PATH`, `EDITOR` and `SSH_ASKPASS` reached the child because
+only `GIT_*` and `PAGER` names were screened (now: anything the launch adds or edits outside the
+named set is refused, and dropping a git variable counts as an edit); a variable written into
+`os.environ` by the in-process Gateway was invisible because the diff read live `os.environ`
+(CPython emits no audit event for an environment write, so the diff is against the launch
+snapshot `BASELINE_ENV`); config values were folded to lower case although git folds keys and
+*not* values, so `pager = CAT` passed as `pager = cat`; section headers were parsed only for a
+line ending in `]`, so `[core] ; comment` hid a whole `[core]` block and a tab before a
+subsection quoted it out of the `filter.*.process` pattern; and an injected `GIT_CONFIG_KEY_n`
+name passed on "not known to be dangerous", so the injection block is now restricted to Core's
+own override names with Core's own values. Repository-level config resolution follows a linked
+worktree to what git actually reads: a worktree has no `<gitdir>/config`, so scanning only that
+path admitted a probe whose *common* config (`<commondir>/config`, named by the gitdir's
+`commondir` file) carried `core.fsmonitor`, and the admitted read-only status probe executed it
+against real git; `<commondir>/config` and `<gitdir>/config.worktree` are now both scanned. These
+controls bound which binary, repository and configuration a probe can reach. They do not make git
+incapable of writing inside the disposable root, and the read-only container mount, not this
+policy, is what bounds where such a write can land.
+
+Child observation is bound to the launch that earned it. The audit hook clears a per-thread
+slot for every admitted `Popen` and writes a housekeeping verdict into it only after a full
+verdict; the profile hook consumes that slot when the child actually exists. A shared token
+list let a `Popen` that raised after the audit event leave a token that a later, unrelated
+child carrying the same argv then consumed, and let one thread's token authorize another
+thread's child. A `Popen`-shaped child whose pid or `/proc` start identity cannot be read now
+raises the boundary refusal instead of returning no record: an untracked child never enters
+the driver's cleanup pid set, so a live one would have let `child_cleanup` PASS over a smaller
+set than the fixture owns.
+
 `scratch_cleanup launch_count=0` is downstream of READY, not an independent defect: Core
 spawns the detached pruner only from `get_scratch_dir(prune=True)` call sites (for example
 per-request prompt building), and the boot temp-env hook skips when `TMPDIR` is preset. No

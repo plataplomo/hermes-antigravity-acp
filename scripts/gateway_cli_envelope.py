@@ -17,7 +17,9 @@ import threading
 import traceback
 
 from gateway_docker import namespace_verified
-from gateway_process_policy import PRUNE_BODY, readonly_git_verdict, scratch_command_verdict, shutdown_command_verified
+from gateway_process_policy import (BASELINE_ENV, PRUNE_BODY, git_probe_context_verdict,
+                                    readonly_git_verdict, scratch_command_verdict,
+                                    shutdown_command_verified)
 from provider_origin import ProviderOrigin
 
 
@@ -46,9 +48,12 @@ class _ChildLedger:
         self.root = root
         self.owned_pids: dict[int, str] = {}
         self.owned_processes: list = []
-        self._verified_launches: list[tuple[str, tuple]] = []
         self._start_time = start_time
-        self._lock = threading.Lock()
+        # One pending verdict per thread: the audit hook writes it for the launch it is
+        # deciding on, and the profile hook consumes it when that child actually exists.
+        # A shared list of tokens outlives a Popen that raised and then authorizes some
+        # later child that merely carries the same argv.
+        self._pending = threading.local()
 
     @staticmethod
     def _key(command) -> tuple:
@@ -57,29 +62,44 @@ class _ChildLedger:
         except TypeError:
             return ()
 
+    def begin_launch_attempt(self) -> None:
+        """Called by the audit hook for every admitted Popen, before any verdict is made.
+
+        Clearing is the whole point: a launch that failed to spawn cannot leave a token
+        behind, because the next attempt on this thread clears the slot before its own
+        child can be observed.
+        """
+        self._pending.slot = None
+
     def note_verified_launch(self, kind: str, command) -> None:
         """Called by the audit hook only after a full housekeeping verdict passed."""
-        with self._lock:
-            self._verified_launches.append((kind, self._key(command)))
+        self._pending.slot = (kind, self._key(command))
 
     def classify(self, command) -> tuple[str, str]:
-        """Consume the matching verified token; command membership alone is never housekeeping."""
+        """Consume this thread's pending verdict; command membership alone is never housekeeping."""
+        slot = getattr(self._pending, "slot", None)
+        self._pending.slot = None
         key = self._key(command)
-        with self._lock:
-            for index, (kind, verified) in enumerate(self._verified_launches):
-                if key and verified == key:
-                    del self._verified_launches[index]
-                    return kind, verified[5] if kind == "scratch" else ""
-        return "other", ""
+        if slot is None or not key or slot[1] != key:
+            return "other", ""
+        return slot[0], key[5] if slot[0] == "scratch" else ""
 
     def observe(self, process):
         """Record one admitted child: start identity, verified classification, evidence line."""
-        pid = getattr(process, "pid", None)
-        if not isinstance(pid, int):
+        if not hasattr(process, "poll"):
             return None
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int) or pid <= 0:
+            # An admitted child we cannot name never reaches the driver's cleanup pid set,
+            # so a live one would leave child_cleanup PASSing over a smaller set than the
+            # fixture actually owns. Refusing is the only honest outcome.
+            raise _ChildIdentityUnavailable
         try:
             started = self._start_time(pid)
-        except FileNotFoundError:
+        except OSError:
+            # /proc can fail with EPERM/EINVAL or a hidepid mount, not only ENOENT. Only
+            # _ChildIdentityUnavailable becomes a recorded boundary refusal; any other type
+            # would escape through the Gateway's own Popen.__init__ and corrupt that launch.
             started = None
         kind, target = self.classify(getattr(process, "args", []))
         if kind != "other":
@@ -172,12 +192,20 @@ def main() -> None:
             command = args[1]
             if not isinstance(command, (list, tuple)) or not command:
                 reject("unapproved_subprocess")
+            # Clear the launch slot before any verdict: a Popen that raises after this event
+            # must not leave a verified token behind for an unrelated later child.
+            ledger.begin_launch_attempt()
             name = Path(os.fsdecode(command[0])).name
             if str(args[0]) != str(command[0]) or str(command[0]) != sys.executable and name != "git":
                 if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"}:
                     reject("subprocess_executable_mismatch")
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
-            is_readonly_git = readonly_git_verdict(command, core)
+            # argv shape alone cannot make a git child read-only: the binary PATH resolves,
+            # the repository the launch cwd selects, and the configuration the child inherits
+            # are decided here, not in argv.
+            is_readonly_git = readonly_git_verdict(command, core) and git_probe_context_verdict(
+                command, core, args[2] if len(args) > 2 else None,
+                args[3] if len(args) > 3 else None, BASELINE_ENV) == ""
             housekeeping = False
             if PRUNE_BODY in command:
                 verdict = scratch_command_verdict(str(args[0]), command, root, core, sys.executable, sys.path)

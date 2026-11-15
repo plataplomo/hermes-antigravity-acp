@@ -7,13 +7,348 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 import unittest
 
-from scripts.gateway_process_policy import (PRUNE_BODY, canonical_owned_path, readonly_git_verdict,
+from scripts.gateway_process_policy import (PRUNE_BODY, canonical_owned_path,
+                                            git_probe_context_verdict, readonly_git_verdict,
                                             scratch_command_verdict)
 
 # The exact object id from the issue #28 Hosted spy (run-spy-1794678130).
 SPY_SHA = "e8bef69f505554154c158aed0a27c429c11791c0"
+
+# A hermetic git identity for throwaway fixture repos; never the operator's config.
+_GIT_ENV = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1", "HOME": os.devnull, "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+
+class GitProbeContextTests(unittest.TestCase):
+    """argv shape alone cannot make a git child read-only: the launch context decides.
+
+    Reproduced against real git in a temp repo (evidence/probe_admitted_git_vectors.py):
+    a PATH swap runs a foreign binary, GIT_TRACE*/GIT_TRACE2_EVENT write a file, and a
+    hostile repo chosen only by the Popen cwd executes core.fsmonitor -- all under argv
+    the shape policy admits. Core's version_info.py:63 probes pass cwd= with no -C, so
+    the cwd is the only thing selecting the repository.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="gw-git-ctx-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        # The container's fixture HOME is a fresh directory; the operator's ~/.gitconfig is
+        # not part of this policy's baseline, so pin a clean identity home for the run.
+        home = self.base / "os-home"
+        home.mkdir()
+        patcher = mock.patch.dict(os.environ, {"HOME": str(home), "XDG_CONFIG_HOME": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+            os.environ.pop(key, None)  # patch.dict restores them on stop
+        self.home = home
+        self.core = self.base / "core"
+        self.core.mkdir()
+        for step in (["init", "-q", str(self.core)], ["-C", str(self.core), "add", "f"],
+                     ["-C", str(self.core), "commit", "-qm", "c1"]):
+            if step[0] == "init":
+                (self.core / "f").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", *step], check=True, capture_output=True, env=_GIT_ENV)
+
+    def verdict(self, argv, cwd=None, env=None, command=None, baseline=None, repo=None):
+        # The baseline is the environment the envelope was launched with; in-process mutation
+        # of os.environ is a separate case tested explicitly below, so each case here states
+        # its own starting environment.
+        return git_probe_context_verdict(command or ["git", *argv], self.core if repo is None
+                                         else repo, cwd, env,
+                                         dict(os.environ) if baseline is None else baseline)
+
+    def test_core_probe_shapes_admitted_in_their_real_launch_context(self):
+        for argv, cwd, env in (
+            (["rev-parse", "HEAD"], self.core, None),
+            (["--no-optional-locks", "status", "--porcelain", "-uno"], self.core, None),
+            (["-C", str(self.core), "rev-parse", "HEAD"], None, None),
+            (["-C", str(self.core), "rev-parse", "HEAD"], None,
+             {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+              "GIT_CONFIG_NOSYSTEM": "1", "GIT_PAGER": "cat", "GIT_EDITOR": "true",
+              "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1",
+              "GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_0": "core.fsmonitor",
+              "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_KEY_1": "core.hooksPath",
+              "GIT_CONFIG_VALUE_1": os.devnull, "GIT_CONFIG_KEY_2": "safe.directory",
+              "GIT_CONFIG_VALUE_2": str(self.core)}),
+        ):
+            with self.subTest(argv=argv, explicit_env=env is not None):
+                self.assertEqual("", self.verdict(argv, cwd=cwd, env=env))
+
+    def test_cwd_must_be_the_pinned_core_checkout(self):
+        hostile = self.base / "hostile"
+        hostile.mkdir()
+        for cwd in (None, self.base, hostile, self.core / "missing"):
+            with self.subTest(cwd=str(cwd)):
+                self.assertEqual("git_probe_repo_unpinned",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=cwd))
+        # A -C that disagrees with the launch cwd is not the pinned checkout either.
+        self.assertEqual("git_probe_repo_unpinned",
+                         self.verdict([], cwd=self.core,
+                                      command=["git", "-C", str(hostile), "rev-parse", "HEAD"]))
+
+    def test_path_swap_runs_a_foreign_binary_and_is_refused(self):
+        fake = self.base / "bin"
+        fake.mkdir()
+        marker = self.base / "pwned"
+        shim = fake / "git"
+        shim.write_text(f"#!/bin/sh\ntouch {marker}\necho {'a' * 40}\n", encoding="utf-8")
+        shim.chmod(0o755)
+        env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}"}
+        self.assertEqual("git_path_overridden",
+                         self.verdict(["rev-parse", "HEAD"], cwd=self.core, env=env))
+        # The refusal is not theoretical: the identical launch really runs the foreign file.
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.core, env=env, capture_output=True)
+        self.assertTrue(marker.exists())
+
+    def test_absolute_path_named_git_outside_the_system_set_is_refused(self):
+        system_git = shutil.which("git")
+        if system_git is None:
+            self.skipTest("git binary required")
+        copy = self.base / "git"
+        copy.write_bytes(Path(system_git).read_bytes())
+        copy.chmod(0o755)
+        self.assertEqual("git_executable_untrusted",
+                         self.verdict([], cwd=self.core,
+                                      command=[str(copy), "-C", str(self.core), "rev-parse", "HEAD"]))
+
+    def test_trace_exec_path_and_identity_redirection_are_refused(self):
+        cases = (
+            ("GIT_TRACE", str(self.base / "trace.log"), "git_trace_enabled"),
+            ("GIT_TRACE2_EVENT", str(self.base / "t2"), "git_trace_enabled"),
+            ("GIT_TRACE_PERFORMANCE", str(self.base / "t3"), "git_trace_enabled"),
+            ("GIT_EXEC_PATH", str(self.base), "git_exec_path_overridden"),
+            ("GIT_CONFIG_NOSYSTEM", "0", "git_config_injection"),
+            ("GIT_CONFIG_GLOBAL", str(self.base / "cfg"), "git_config_injection"),
+            ("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=/tmp/x'", "git_config_injection"),
+            ("GIT_PAGER", "/tmp/evil", "git_environment_override_unverified"),
+            ("GIT_SSH_COMMAND", "/tmp/evil", "git_environment_override_unverified"),
+            ("PATH", "/tmp/only", "git_path_overridden"),
+            ("HOME", str(self.base), "git_home_overridden"),
+            ("XDG_CONFIG_HOME", str(self.base), "git_home_overridden"),
+        )
+        for key, value, reason in cases:
+            with self.subTest(key=key):
+                self.assertEqual(reason, self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                                      env={**os.environ, key: value}))
+
+    def test_trace_write_through_an_admitted_probe_is_reproduced_then_refused(self):
+        trace = self.base / "trace.log"
+        env = {**os.environ, "GIT_TRACE": str(trace)}
+        self.assertEqual("git_trace_enabled",
+                         self.verdict(["rev-parse", "HEAD"], cwd=self.core, env=env))
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.core, env=env, capture_output=True)
+        self.assertTrue(trace.is_file() and trace.stat().st_size > 0)
+
+    def test_hostile_repo_selected_only_by_cwd_really_executes_fsmonitor(self):
+        hostile = self.base / "hostile"
+        hostile.mkdir()
+        subprocess.run(["git", "init", "-q", str(hostile)], check=True, capture_output=True,
+                       env=_GIT_ENV)
+        hook, marker = self.base / "fm.sh", self.base / "fsmonitor-ran"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+        subprocess.run(["git", "-C", str(hostile), "config", "core.fsmonitor", str(hook)],
+                       check=True, capture_output=True, env=_GIT_ENV)
+        (hostile / "untracked").write_text("u\n", encoding="utf-8")
+        argv = ["--no-optional-locks", "status", "--porcelain"]
+        self.assertEqual("git_probe_repo_unpinned", self.verdict(argv, cwd=hostile))
+        # Reproduce the execution the policy must refuse; the pinned checkout stays clean.
+        subprocess.run(["git", *argv], cwd=hostile, capture_output=True)
+        self.assertTrue(marker.exists())
+        self.assertEqual("", self.verdict(argv, cwd=self.core))
+
+    def test_exec_capable_config_injection_is_refused_but_core_hardening_is_not(self):
+        for name, value in (("core.fsmonitor", "/tmp/evil"), ("core.hooksPath", "/tmp/hooks"),
+                            ("core.pager", "/tmp/evil"), ("filter.evil.process", "/tmp/evil"),
+                            ("alias.x", "!/tmp/evil"), ("credential.helper", "/tmp/evil")):
+            with self.subTest(name=name):
+                self.assertEqual("git_config_injection",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                              env={**os.environ, "GIT_CONFIG_COUNT": "1",
+                                                   "GIT_CONFIG_KEY_0": name,
+                                                   "GIT_CONFIG_VALUE_0": value}))
+        for name, value in (("core.fsmonitor", "false"), ("core.hooksPath", os.devnull),
+                            ("core.pager", "cat"), ("safe.directory", str(self.core)),
+                            ("core.untrackedCache", "false")):
+            with self.subTest(hardening=name):
+                self.assertEqual("", self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                                  env={**os.environ, "GIT_CONFIG_COUNT": "1",
+                                                       "GIT_CONFIG_KEY_0": name,
+                                                       "GIT_CONFIG_VALUE_0": value}))
+
+    def test_exec_capable_setting_in_the_pinned_repo_config_is_refused(self):
+        config = self.core / ".git" / "config"
+        config.write_text(config.read_text(encoding="utf-8") + "[core]\n\tfsmonitor = /tmp/x\n",
+                          encoding="utf-8")
+        self.assertEqual("git_effective_config_exec_capable",
+                         self.verdict(["rev-parse", "HEAD"], cwd=self.core))
+
+    def test_planted_global_config_reaches_an_inherited_probe_and_is_refused(self):
+        # Reproduced against real git: with the fixture HOME writable (it lives under the
+        # container's only writable mount) and an inherited environment, a planted global
+        # config turns the admitted read-only status probe into an external program run.
+        hook, marker = self.base / "fm.sh", self.base / "fsmonitor-ran"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+        self.home.joinpath(".gitconfig").write_text(
+            f"[core]\n\tfsmonitor = {hook}\n", encoding="utf-8")
+        argv = ["--no-optional-locks", "status", "--porcelain"]
+        self.assertEqual("git_effective_config_exec_capable", self.verdict(argv, cwd=self.core))
+        subprocess.run(["git", *argv], cwd=self.core, capture_output=True)
+        self.assertTrue(marker.exists())
+        # Core's own probes pin the global file away, so the same baseline admits them.
+        self.assertEqual("", self.verdict(argv, cwd=self.core,
+                                          env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+                                               "GIT_CONFIG_SYSTEM": os.devnull,
+                                               "GIT_CONFIG_NOSYSTEM": "1"}))
+
+    def test_config_include_directive_is_refused_and_really_widens(self):
+        # git loads the included file into its effective config, so a scanned file that looks
+        # inert is not evidence: reproduced with real git, the included core.fsmonitor runs.
+        hook, marker = self.base / "fm.sh", self.base / "fsmonitor-ran"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+        included = self.base / "extra.cfg"
+        included.write_text(f"[core]\n\tfsmonitor = {hook}\n", encoding="utf-8")
+        self.home.joinpath(".gitconfig").write_text(
+            f"[include]\n\tpath = {included}\n", encoding="utf-8")
+        argv = ["--no-optional-locks", "status", "--porcelain"]
+        self.assertEqual("git_effective_config_exec_capable", self.verdict(argv, cwd=self.core))
+        subprocess.run(["git", *argv], cwd=self.core, capture_output=True)
+        self.assertTrue(marker.exists())
+
+    def test_include_injection_through_the_config_block_is_refused(self):
+        for name in ("include.path", "includeif.gitdir:/gw.path"):
+            with self.subTest(name=name):
+                self.assertEqual("git_config_injection",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                              env={**os.environ, "GIT_CONFIG_COUNT": "1",
+                                                   "GIT_CONFIG_KEY_0": name,
+                                                   "GIT_CONFIG_VALUE_0": str(self.base / "x.cfg")}))
+
+    def test_planted_xdg_config_is_refused(self):
+        xdg = self.base / "xdg" / "git"
+        xdg.mkdir(parents=True)
+        (xdg / "config").write_text("[core]\n\thooksPath = /tmp/hooks\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.base / "xdg")}):
+            self.assertEqual("git_effective_config_exec_capable",
+                             self.verdict(["rev-parse", "HEAD"], cwd=self.core))
+
+    def test_inert_global_config_is_not_refused(self):
+        self.home.joinpath(".gitconfig").write_text(
+            "[user]\n\tname = t\n\temail = t@t\n", encoding="utf-8")
+        self.assertEqual("", self.verdict(["rev-parse", "HEAD"], cwd=self.core))
+
+    def test_non_git_environment_injection_is_refused(self):
+        # A name-scoped screen (GIT_*, PAGER) let all of these reach the admitted git child.
+        for key, value in (("LD_PRELOAD", str(self.base / "evil.so")),
+                           ("LD_LIBRARY_PATH", str(self.base)),
+                           ("EDITOR", str(self.base / "evil")),
+                           ("VISUAL", str(self.base / "evil")),
+                           ("SSH_ASKPASS", str(self.base / "evil")),
+                           ("TMPDIR", str(self.base))):
+            with self.subTest(key=key):
+                self.assertEqual("git_environment_override_unverified",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                              env={**os.environ, key: value}))
+
+    def test_runtime_environment_mutation_is_not_the_launch_baseline(self):
+        # The policed Gateway shares this process and CPython emits no audit event for an
+        # os.environ write, so the diff must be against the launch snapshot, not live state.
+        snapshot = dict(os.environ)
+        os.environ["GIT_DIR"] = str(self.base / "evil.git")
+        try:
+            self.assertEqual("git_config_injection",
+                             self.verdict(["rev-parse", "HEAD"], cwd=self.core, baseline=snapshot))
+            os.environ["GIT_TRACE2_PERF"] = str(self.base / "trace")
+            self.assertEqual("git_trace_enabled",
+                             self.verdict(["rev-parse", "HEAD"], cwd=self.core, baseline=snapshot))
+        finally:
+            os.environ.pop("GIT_DIR", None)
+            os.environ.pop("GIT_TRACE2_PERF", None)
+
+    def test_dropping_a_git_variable_is_an_unverified_edit(self):
+        os.environ["GIT_OPTIONAL_LOCKS"] = "0"
+        self.addCleanup(os.environ.pop, "GIT_OPTIONAL_LOCKS", None)
+        self.assertEqual("git_environment_override_unverified",
+                         self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                      env={key: value for key, value in os.environ.items()
+                                           if key != "GIT_OPTIONAL_LOCKS"}))
+
+    def test_unknown_key_in_the_config_injection_block_is_refused(self):
+        for name in ("core.anything", "credential.https://x.helper", "diff.x.textconv",
+                     "core.attributesFile"):
+            with self.subTest(name=name):
+                self.assertEqual("git_config_injection",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=self.core,
+                                              env={**os.environ, "GIT_CONFIG_COUNT": "1",
+                                                   "GIT_CONFIG_KEY_0": name,
+                                                   "GIT_CONFIG_VALUE_0": "whatever"}))
+
+    def test_config_values_are_compared_case_sensitively(self):
+        # git folds config keys but not config values, so `pager = CAT` is not `pager = cat`.
+        config = self.core / ".git" / "config"
+        config.write_text(config.read_text(encoding="utf-8") + "[core]\n\tpager = CAT\n",
+                          encoding="utf-8")
+        self.assertEqual("git_effective_config_exec_capable",
+                         self.verdict(["rev-parse", "HEAD"], cwd=self.core))
+
+    def test_section_header_variants_git_accepts_are_still_parsed(self):
+        config = self.core / ".git" / "config"
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, "utf-8")
+        for header, option, value in (("[core] ; trailing comment", "fsmonitor", "/tmp/x"),
+                                      ("[core]\t", "fsmonitor", "/tmp/x"),
+                                      ('[filter\t"evil"]', "process", "/tmp/x"),
+                                      ("[core]", "hooksPath", "/tmp/hooks")):
+            with self.subTest(header=header):
+                config.write_text(original + f"{header}\n\t{option} = {value}\n",
+                                  encoding="utf-8")
+                self.assertEqual("git_effective_config_exec_capable",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=self.core))
+
+    def test_linked_worktree_common_and_worktree_configs_are_scanned(self):
+        # A linked worktree has no <gitdir>/config at all: git loads the common dir's config
+        # (named by the gitdir's `commondir` file) plus <gitdir>/config.worktree when
+        # extensions.worktreeConfig is on. Reproduced against real git: scanning only the
+        # worktree gitdir admitted a probe whose common config carried core.fsmonitor, and the
+        # admitted read-only status probe executed it.
+        worktree = self.base / "wt"
+        subprocess.run(["git", "-C", str(self.core), "worktree", "add", "-q", str(worktree),
+                        "HEAD"], check=True, capture_output=True, env=_GIT_ENV)
+        gitdir = Path((worktree / ".git").read_text(encoding="utf-8").split("gitdir:", 1)[1].strip())
+        common_config = self.core / ".git" / "config"
+        original = common_config.read_text(encoding="utf-8")
+        self.addCleanup(common_config.write_text, original, "utf-8")
+        for label, path, text in (
+                ("common config", common_config,
+                 original + "[core]\n\tfsmonitor = /tmp/planted-fsmonitor\n"),
+                ("config.worktree", gitdir / "config.worktree",
+                 "[extensions]\n\tworktreeConfig = true\n"
+                 "[core]\n\tfsmonitor = /tmp/planted-fsmonitor\n")):
+            with self.subTest(config=label):
+                path.write_text(text, encoding="utf-8")
+                self.assertEqual("git_effective_config_exec_capable",
+                                 self.verdict(["--no-optional-locks", "status", "--porcelain"],
+                                              cwd=worktree, repo=worktree))
+                if path == common_config:
+                    path.write_text(original, encoding="utf-8")
+                else:
+                    path.unlink()
+                self.assertEqual("", self.verdict(["--no-optional-locks", "status", "--porcelain"],
+                                                  cwd=worktree, repo=worktree))
+
+    def test_unreadable_environment_or_argv_fails_closed(self):
+        for env in (object(), ["not", "a", "mapping"], 7, {"GIT_TRACE": 5}):
+            with self.subTest(env=repr(env)[:18]):
+                self.assertEqual("git_environment_unreadable",
+                                 self.verdict(["rev-parse", "HEAD"], cwd=self.core, env=env))
 
 
 class ScratchAdmissionTests(unittest.TestCase):
