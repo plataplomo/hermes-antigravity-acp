@@ -70,6 +70,11 @@ class _ChildLedger:
         child can be observed.
         """
         self._pending.slot = None
+        self._pending.refused_before_spawn = False
+
+    def note_refused_before_spawn(self) -> None:
+        """Remember a refusal raised inside the Popen audit event, before OS spawn."""
+        self._pending.refused_before_spawn = True
 
     def note_verified_launch(self, kind: str, command) -> None:
         """Called by the audit hook only after a full housekeeping verdict passed."""
@@ -89,6 +94,14 @@ class _ChildLedger:
         if not hasattr(process, "poll"):
             return None
         pid = getattr(process, "pid", None)
+        refused = getattr(self._pending, "refused_before_spawn", False)
+        self._pending.refused_before_spawn = False
+        if (refused and pid is None and getattr(process, "_child_created", None) is False):
+            # CPython profiles an exception exit from Popen.__init__ as a return. An
+            # audit-hook refusal happened before spawn, so there is no child to track;
+            # the original sticky boundary refusal remains intact.
+            self._pending.slot = None
+            return None
         if not isinstance(pid, int) or pid <= 0:
             # An admitted child we cannot name never reaches the driver's cleanup pid set,
             # so a live one would leave child_cleanup PASSing over a smaller set than the
@@ -189,16 +202,22 @@ def main() -> None:
             if args[0] not in {"127.0.0.1", "::1", "localhost", None}:
                 reject("external_name_resolution")
         elif event == "subprocess.Popen":
+            # A rejection at this audit event is before CPython's OS spawn. Record
+            # that fact separately from the sticky refusal so the profile callback
+            # does not mistake the failed initializer for an untracked live child.
+            ledger.begin_launch_attempt()
+
+            def reject_launch(reason: str) -> None:
+                ledger.note_refused_before_spawn()
+                reject(reason)
+
             command = args[1]
             if not isinstance(command, (list, tuple)) or not command:
-                reject("unapproved_subprocess")
-            # Clear the launch slot before any verdict: a Popen that raises after this event
-            # must not leave a verified token behind for an unrelated later child.
-            ledger.begin_launch_attempt()
+                reject_launch("unapproved_subprocess")
             name = Path(os.fsdecode(command[0])).name
             if str(args[0]) != str(command[0]) or str(command[0]) != sys.executable and name != "git":
                 if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"}:
-                    reject("subprocess_executable_mismatch")
+                    reject_launch("subprocess_executable_mismatch")
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
             # argv shape alone cannot make a git child read-only: the binary PATH resolves,
             # the repository the launch cwd selects, and the configuration the child inherits
@@ -210,16 +229,16 @@ def main() -> None:
             if PRUNE_BODY in command:
                 verdict = scratch_command_verdict(str(args[0]), command, root, core, sys.executable, sys.path)
                 if verdict != "scratch_process_namespace_unverified" or not confined:
-                    reject(verdict)
+                    reject_launch(verdict)
                 ledger.note_verified_launch("scratch", command)
                 housekeeping = True
             if name in {"timeout", "gtimeout"} and "bash" in command:
                 if not confined or not shutdown_command_verified(str(args[0]), command, core, os.getpid()):
-                    reject("shutdown_diagnostic_not_verified")
+                    reject_launch("shutdown_diagnostic_not_verified")
                 ledger.note_verified_launch("shutdown", command)
                 housekeeping = True
             if not (is_fixture or is_readonly_git or housekeeping):
-                reject("unapproved_subprocess")
+                reject_launch("unapproved_subprocess")
         elif event in {"os.kill", "os.killpg"}:
             pid, signum = args
             if pid == os.getpid():

@@ -37,6 +37,7 @@ class _FakePopen:
         self.pid = pid
         self.args = args
         self._returncode = returncode
+        self._child_created: bool | None = None
 
     def poll(self):
         return self._returncode
@@ -158,6 +159,64 @@ class ChildLedgerTests(unittest.TestCase):
                 with self.assertRaises(envelope._ChildIdentityUnavailable):
                     self.ledger.observe(bad)
         self.assertEqual([], self.observations())
+
+    def test_pre_spawn_mismatch_does_not_fabricate_an_identity_refusal(self):
+        # Run the real CPython audit/profile pair in another interpreter: audit hooks
+        # are permanent for a process, so installing one in pytest would poison it.
+        script = r'''
+import json, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from gateway_cli_envelope import _ChildLedger, _ChildIdentityUnavailable
+ledger = _ChildLedger(Path(sys.argv[2]))
+reasons = []
+def audit(event, args):
+    if event == "subprocess.Popen":
+        ledger.begin_launch_attempt()
+        ledger.note_refused_before_spawn()
+        reasons.append("subprocess_executable_mismatch")
+        raise PermissionError("disposable_gateway_boundary")
+def profile(frame, event, arg):
+    if event == "return" and frame.f_code.co_name == "__init__" and frame.f_globals.get("__name__") == "subprocess":
+        try:
+            ledger.observe(frame.f_locals.get("self"))
+        except _ChildIdentityUnavailable:
+            reasons.append("owned_child_identity_unavailable")
+sys.addaudithook(audit)
+sys.setprofile(profile)
+try:
+    subprocess.Popen(["/bin/true"])
+except PermissionError:
+    pass
+finally:
+    sys.setprofile(None)
+print(json.dumps({"reasons": reasons, "children": ledger.owned_pids,
+                  "evidence_exists": (Path(sys.argv[2]) / "owned-core-children.jsonl").exists()}))
+'''
+        completed = subprocess.run([sys.executable, "-c", script, str(SCRIPTS), str(self.root)],
+                                   check=True, capture_output=True, text=True)
+        result = json.loads(completed.stdout)
+        self.assertEqual(["subprocess_executable_mismatch"], result["reasons"])
+        self.assertEqual({}, result["children"])
+        self.assertFalse(result["evidence_exists"])
+
+    def test_refusal_marker_cannot_hide_an_unknown_or_live_child(self):
+        for pid, created in ((None, True), (None, None), (0, False)):
+            with self.subTest(pid=pid, created=created):
+                self.ledger.begin_launch_attempt()
+                self.ledger.note_refused_before_spawn()
+                process = _FakePopen(pid, self.scratch_argv())
+                process._child_created = created
+                with self.assertRaises(envelope._ChildIdentityUnavailable):
+                    self.ledger.observe(process)
+        # A subsequent launch clears a stale marker, even with the same pid-less shape.
+        self.ledger.begin_launch_attempt()
+        self.ledger.note_refused_before_spawn()
+        self.ledger.begin_launch_attempt()
+        process = _FakePopen(None, self.scratch_argv())
+        process._child_created = False
+        with self.assertRaises(envelope._ChildIdentityUnavailable):
+            self.ledger.observe(process)
 
     def test_non_process_objects_are_not_observed(self):
         for process in (None, object()):

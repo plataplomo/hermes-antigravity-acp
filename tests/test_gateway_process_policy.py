@@ -41,10 +41,16 @@ class GitProbeContextTests(unittest.TestCase):
         # not part of this policy's baseline, so pin a clean identity home for the run.
         home = self.base / "os-home"
         home.mkdir()
-        patcher = mock.patch.dict(os.environ, {"HOME": str(home), "XDG_CONFIG_HOME": ""})
+        # Use an owned system config rather than the host's /etc/gitconfig. GitHub's
+        # runner can have executable filters there, and the policy must reject those;
+        # that unrelated host setting must not invalidate our clean-repo fixtures.
+        self.system_config = self.base / "system.gitconfig"
+        self.system_config.write_text("", encoding="utf-8")
+        patcher = mock.patch.dict(os.environ, {"HOME": str(home), "XDG_CONFIG_HOME": "",
+                                               "GIT_CONFIG_SYSTEM": str(self.system_config)})
         patcher.start()
         self.addCleanup(patcher.stop)
-        for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+        for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
             os.environ.pop(key, None)  # patch.dict restores them on stop
         self.home = home
         self.core = self.base / "core"
@@ -79,6 +85,18 @@ class GitProbeContextTests(unittest.TestCase):
         ):
             with self.subTest(argv=argv, explicit_env=env is not None):
                 self.assertEqual("", self.verdict(argv, cwd=cwd, env=env))
+
+    def test_system_config_is_checked_and_core_can_pin_it_away(self):
+        argv = ["rev-parse", "HEAD"]
+        self.system_config.write_text("[user]\n\tname = safe\n", encoding="utf-8")
+        self.assertEqual("", self.verdict(argv, cwd=self.core))
+        self.system_config.write_text("[filter \"lfs\"]\n\tprocess = /tmp/filter\n",
+                                      encoding="utf-8")
+        self.assertEqual("git_effective_config_exec_capable", self.verdict(argv, cwd=self.core))
+        # Core's own noninteractive environment disables system config; retain that
+        # positive control without ever permitting the inherited dangerous setting.
+        env = {**os.environ, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        self.assertEqual("", self.verdict(argv, cwd=self.core, env=env))
 
     def test_cwd_must_be_the_pinned_core_checkout(self):
         hostile = self.base / "hostile"
