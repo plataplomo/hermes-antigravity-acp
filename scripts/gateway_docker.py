@@ -24,6 +24,28 @@ import tarfile
 import tempfile
 import time
 
+try:
+    from gateway_process_policy import DIAGNOSTIC_MARKER, safe_diagnostic
+except ImportError:
+    from scripts.gateway_process_policy import DIAGNOSTIC_MARKER, safe_diagnostic
+
+
+def sanitized_diagnostics(log: Path) -> set[tuple[str, str, str]]:
+    """Discard every container log line except a complete, fixed-enum marker."""
+    try:
+        with log.open(encoding="utf-8", errors="replace") as stream:
+            result = set()
+            for line in stream:
+                words = line.split()
+                if len(words) == 4 and words[0] == DIAGNOSTIC_MARKER:
+                    value = safe_diagnostic(words[1:])
+                    if value:
+                        result.add(value)
+            return result
+    except OSError:
+        return set()
+
+
 POLICY = "/phasec-policy.json"
 LIMIT = 128
 CHECKS = ("nonroot", "capabilities_empty", "no_new_privileges", "readonly_root", "pid_namespace",
@@ -409,6 +431,9 @@ def main(argv: list[str] | None = None) -> int:
             process.wait(timeout=15)
         if image:
             image_removed = remove_owned(docker, "image", image)
+        if directory is not None:
+            for diagnostic in sorted(sanitized_diagnostics(Path(directory) / "container.log")):
+                print(DIAGNOSTIC_MARKER, *diagnostic)
         if directory is not None and (container is None or removed):
             shutil.rmtree(directory)
         record["docker_duration_seconds"] = round(time.monotonic() - started, 3)

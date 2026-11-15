@@ -18,7 +18,7 @@ import traceback
 
 from gateway_docker import namespace_verified
 from gateway_process_policy import (BASELINE_ENV, PRUNE_BODY, git_probe_context_verdict,
-                                    readonly_git_verdict, scratch_command_verdict,
+                                    mismatch_diagnostic, readonly_git_verdict, scratch_command_verdict,
                                     shutdown_command_verified)
 from provider_origin import ProviderOrigin
 
@@ -154,12 +154,15 @@ def main() -> None:
             path = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / path
         return path.resolve()
 
-    def reject(reason: str) -> None:
+    def reject(reason: str, launch=None) -> None:
         refused.append(reason)
         with (root / "audit-refusals.jsonl").open("a", encoding="utf-8") as stream:
-            frames = [{"file": frame.filename, "line": frame.lineno, "function": frame.name}
-                      for frame in traceback.extract_stack(limit=25)]
-            stream.write(json.dumps({"reason": reason, "frames": frames}) + "\n")
+            stack = traceback.extract_stack(limit=25)
+            frames = [{"file": frame.filename, "line": frame.lineno, "function": frame.name} for frame in stack]
+            event = {"reason": reason, "frames": frames}
+            if launch is not None:
+                event["diagnostic"] = mismatch_diagnostic(launch[0], launch[1], sys.executable, core, stack)
+            stream.write(json.dumps(event) + "\n")
         raise PermissionError("disposable_gateway_boundary")
 
     def audit(event: str, args: tuple) -> None:
@@ -207,9 +210,9 @@ def main() -> None:
             # does not mistake the failed initializer for an untracked live child.
             ledger.begin_launch_attempt()
 
-            def reject_launch(reason: str) -> None:
+            def reject_launch(reason: str, launch=None) -> None:
                 ledger.note_refused_before_spawn()
-                reject(reason)
+                reject(reason, launch)
 
             command = args[1]
             if not isinstance(command, (list, tuple)) or not command:
@@ -217,7 +220,7 @@ def main() -> None:
             name = Path(os.fsdecode(command[0])).name
             if str(args[0]) != str(command[0]) or str(command[0]) != sys.executable and name != "git":
                 if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"}:
-                    reject_launch("subprocess_executable_mismatch")
+                    reject_launch("subprocess_executable_mismatch", (args[0], command[0]))
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
             # argv shape alone cannot make a git child read-only: the binary PATH resolves,
             # the repository the launch cwd selects, and the configuration the child inherits

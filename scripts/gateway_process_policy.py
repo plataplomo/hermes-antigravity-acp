@@ -13,6 +13,54 @@ import shutil
 from pathlib import Path
 from typing import Sequence
 
+# Only these literal tokens may leave the disposable runner as refusal diagnostics.
+DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "uname", "which", "ps", "rg",
+                                    "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "other"})
+DIAGNOSTIC_MISMATCHES = frozenset({"executable_argv0", "unapproved_executable", "both"})
+DIAGNOSTIC_CORE_FILES = {
+    "gateway/run.py": "gateway_run", "gateway/run_shutdown.py": "gateway_run_shutdown",
+    "gateway/shutdown_forensics.py": "gateway_shutdown_forensics", "gateway/status.py": "gateway_status",
+    "hermes_cli/main.py": "cli_main", "hermes_cli/gateway.py": "cli_gateway",
+    "hermes_cli/version_info.py": "cli_version_info", "hermes_cli/boot_bootstrap.py": "cli_boot_bootstrap",
+    "hermes_cli/main_web_build.py": "cli_main_web_build", "hermes_cli/plugin_catalog.py": "cli_plugin_catalog",
+    "hermes_constants_scratch.py": "scratch", "hermes_constants_scratch_detach.py": "scratch_detach",
+    "tui_gateway/git_probe.py": "tui_git_probe", "run_agent.py": "run_agent",
+}
+DIAGNOSTIC_CALLSITES = frozenset((*DIAGNOSTIC_CORE_FILES.values(), "other"))
+DIAGNOSTIC_MARKER = "PHASEC_REFUSAL_DIAGNOSTIC"
+
+
+def safe_diagnostic(value: object) -> tuple[str, str, str] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 3 or not all(isinstance(v, str) for v in value):
+        return None
+    executable, mismatch, callsite = value
+    if (executable not in DIAGNOSTIC_EXECUTABLES or mismatch not in DIAGNOSTIC_MISMATCHES
+            or callsite not in DIAGNOSTIC_CALLSITES):
+        return None
+    return executable, mismatch, callsite
+
+
+def mismatch_diagnostic(executable: object, argv0: object, python: str, core: Path, frames: list) -> tuple[str, str, str]:
+    """Map inputs and Core frames to constants; never publish source strings or paths."""
+    first, actual = str(argv0), str(executable)
+    name = Path(os.fsdecode(argv0)).name
+    category = ("python" if first == python or name in {"python", "python3", "python3.14"}
+                else name if name in DIAGNOSTIC_EXECUTABLES else "other")
+    mismatch_argv = actual != first
+    mismatch_executable = first != python and name != "git"
+    mismatch = ("both" if mismatch_argv and mismatch_executable else
+                "executable_argv0" if mismatch_argv else "unapproved_executable")
+    callsite = "other"
+    for frame in reversed(frames):
+        for path, token in DIAGNOSTIC_CORE_FILES.items():
+            if frame.filename == str(core / path):
+                callsite = token
+                break
+        if callsite != "other":
+            break
+    return category, mismatch, callsite
+
+
 PRUNE_BODY = ("import sys; sys.path[:] = sys.argv[3:]; "
               "import hermes_constants_scratch_detach as d; d.run(*sys.argv[1:3])")
 
