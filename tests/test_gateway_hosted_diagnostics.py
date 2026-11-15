@@ -26,6 +26,16 @@ def test_mismatch_classifies_without_raw_values():
         'systemctl', 'unapproved_executable', 'cli_gateway_service_pids')
     frames[0].name = 'secret'
     assert mismatch_diagnostic('systemctl', 'systemctl', '/python', core, frames)[2] == 'cli_gateway'
+    frames = [SimpleNamespace(filename='/private/core/hermes_cli/gateway.py', name='_systemd_operational'),
+              SimpleNamespace(filename='/private/core/hermes_cli/gateway.py', name='_run_systemctl')]
+    command = ['systemctl', '--user', 'is-system-running']
+    value = mismatch_diagnostic('systemctl', command[0], '/python', core, frames, command)
+    assert value == ('systemctl_status_user', 'unapproved_executable', 'cli_gateway_systemd_operational')
+    assert safe_diagnostic(value) == value
+    command.append('secret')
+    assert mismatch_diagnostic('systemctl', command[0], '/python', core, frames, command)[0] == 'systemctl'
+    assert mismatch_diagnostic('systemctl', 'systemctl', '/python', core, frames,
+                               ['systemctl', 'is-system-running'])[0] == 'systemctl_status_system'
 
 
 def test_audit_to_host_filters_every_untrusted_field(tmp_path):

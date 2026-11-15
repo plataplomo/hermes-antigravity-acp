@@ -161,7 +161,7 @@ def main() -> None:
             frames = [{"file": frame.filename, "line": frame.lineno, "function": frame.name} for frame in stack]
             event = {"reason": reason, "frames": frames}
             if launch is not None:
-                event["diagnostic"] = mismatch_diagnostic(launch[0], launch[1], sys.executable, core, stack)
+                event["diagnostic"] = mismatch_diagnostic(launch[0], launch[1][0], sys.executable, core, stack, launch[1])
             stream.write(json.dumps(event) + "\n")
         raise PermissionError("disposable_gateway_boundary")
 
@@ -220,7 +220,7 @@ def main() -> None:
             name = Path(os.fsdecode(command[0])).name
             if str(args[0]) != str(command[0]) or str(command[0]) != sys.executable and name != "git":
                 if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"}:
-                    reject_launch("subprocess_executable_mismatch", (args[0], command[0]))
+                    reject_launch("subprocess_executable_mismatch", (args[0], command))
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
             # argv shape alone cannot make a git child read-only: the binary PATH resolves,
             # the repository the launch cwd selects, and the configuration the child inherits

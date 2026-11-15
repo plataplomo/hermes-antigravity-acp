@@ -16,7 +16,8 @@ from typing import Sequence
 # Only these literal tokens may leave the disposable runner as refusal diagnostics.
 DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "uname", "which", "ps", "rg",
                                     "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "systemctl",
-                                    "loginctl", "launchctl", "journalctl", "other"})
+                                    "loginctl", "launchctl", "journalctl", "systemctl_status_user",
+                                    "systemctl_status_system", "other"})
 DIAGNOSTIC_MISMATCHES = frozenset({"executable_argv0", "unapproved_executable", "both"})
 DIAGNOSTIC_CORE_FILES = {
     "gateway/run.py": "gateway_run", "gateway/run_shutdown.py": "gateway_run_shutdown",
@@ -34,7 +35,8 @@ DIAGNOSTIC_GATEWAY_FUNCTIONS = {
     "get_systemd_linger_status": "cli_gateway_linger_status", "_loginctl_enable_linger": "cli_gateway_linger_enable",
     "systemd_status": "cli_gateway_systemd_status", "_spawn_gateway_restart_watcher": "cli_gateway_restart_watcher",
 }
-DIAGNOSTIC_CALLSITES = frozenset((*DIAGNOSTIC_CORE_FILES.values(), *DIAGNOSTIC_GATEWAY_FUNCTIONS.values(), "other"))
+DIAGNOSTIC_CALLSITES = frozenset((*DIAGNOSTIC_CORE_FILES.values(), *DIAGNOSTIC_GATEWAY_FUNCTIONS.values(),
+                                  "cli_gateway_systemd_operational", "other"))
 DIAGNOSTIC_MARKER = "PHASEC_REFUSAL_DIAGNOSTIC"
 
 
@@ -48,7 +50,8 @@ def safe_diagnostic(value: object) -> tuple[str, str, str] | None:
     return executable, mismatch, callsite
 
 
-def mismatch_diagnostic(executable: object, argv0: object, python: str, core: Path, frames: list) -> tuple[str, str, str]:
+def mismatch_diagnostic(executable: object, argv0: object, python: str, core: Path, frames: list,
+                        command=None) -> tuple[str, str, str]:
     """Map inputs and Core frames to constants; never publish source strings or paths."""
     first, actual = str(argv0), str(executable)
     name = Path(os.fsdecode(argv0)).name
@@ -67,6 +70,16 @@ def mismatch_diagnostic(executable: object, argv0: object, python: str, core: Pa
                 break
         if callsite != "other":
             break
+    if category == "systemctl":
+        if command == ["systemctl", "--user", "is-system-running"]:
+            category = "systemctl_status_user"
+        elif command == ["systemctl", "is-system-running"]:
+            category = "systemctl_status_system"
+    if callsite == "cli_gateway_systemctl" and any(
+        frame.filename == str(core / "hermes_cli/gateway.py") and frame.name == "_systemd_operational"
+        for frame in frames
+    ):
+        callsite = "cli_gateway_systemd_operational"
     return category, mismatch, callsite
 
 
