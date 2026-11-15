@@ -84,6 +84,12 @@ def test_systemctl_status_exact_commands_and_context(tmp_path, command):
         assert check()
         assert policy.systemctl_status_reason('systemctl', command, root, {**env, 'SECRET': 'value'},
                                               root, True, baseline=env) == 'env'
+        assert policy.systemctl_status_reason('systemctl', command, root, {**env, 'PYTHONUTF8': '1'},
+                                              root, True, baseline=env) == 'env_core_markers'
+        assert policy.systemctl_status_reason('systemctl', command, root, {**env, 'PYTHONUTF8': 'secret'},
+                                              root, True, baseline=env) == 'env'
+        assert safe_diagnostic(('systemctl_block_env_core_markers', 'unapproved_executable',
+                                'cli_gateway_systemd_operational')) is not None
         assert safe_diagnostic(('systemctl_block_env', 'unapproved_executable',
                                 'cli_gateway_systemd_operational')) is not None
         assert safe_diagnostic(('systemctl_block_SECRET', 'unapproved_executable',

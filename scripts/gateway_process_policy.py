@@ -19,7 +19,8 @@ DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "unam
                                     "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "systemctl",
                                     "loginctl", "launchctl", "journalctl", "systemctl_status_user",
                                     "systemctl_status_system", "systemctl_block_shape", "systemctl_block_env_type",
-                                    "systemctl_block_path", "systemctl_block_env", "systemctl_block_env_unsafe",
+                                    "systemctl_block_path", "systemctl_block_env", "systemctl_block_env_core_markers",
+                                    "systemctl_block_env_unsafe",
                                     "systemctl_block_cwd", "systemctl_block_runtime", "systemctl_block_bus",
                                     "systemctl_block_binary", "systemctl_block_error", "other"})
 DIAGNOSTIC_MISMATCHES = frozenset({"executable_argv0", "unapproved_executable", "both"})
@@ -547,6 +548,13 @@ def systemctl_status_reason(executable, command, cwd, env, root: Path, confined:
             or any(not item or not os.path.isabs(item) for item in child["PATH"].split(os.pathsep))):
         return "path"
     if {k: v for k, v in child.items() if k != "PATH"} != {k: v for k, v in ambient.items() if k != "PATH"}:
+        # Diagnostic classification only: no environment name or value is emitted.
+        markers = {"AI_AGENT": "hermes-agent", "HERMES_AGENT": "true", "PYTHONUTF8": "1",
+                   "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1", "_HERMES_GATEWAY": "1",
+                   "HERMES_QUIET": "1", "HERMES_TURN_LEASE_TIMEOUT": "5"}
+        changes = {key for key in set(child) | set(ambient) if key != "PATH" and child.get(key) != ambient.get(key)}
+        if changes and all(key not in ambient and key in markers and child.get(key) == markers[key] for key in changes):
+            return "env_core_markers"
         return "env"
     if any(name.startswith("SYSTEMD_") or name.startswith("DBUS_")
            or name in {"LD_PRELOAD", "LD_LIBRARY_PATH"} for name in child):
