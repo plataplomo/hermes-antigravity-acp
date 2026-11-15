@@ -15,7 +15,8 @@ from typing import Sequence
 
 # Only these literal tokens may leave the disposable runner as refusal diagnostics.
 DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "uname", "which", "ps", "rg",
-                                    "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "other"})
+                                    "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "systemctl",
+                                    "loginctl", "launchctl", "journalctl", "other"})
 DIAGNOSTIC_MISMATCHES = frozenset({"executable_argv0", "unapproved_executable", "both"})
 DIAGNOSTIC_CORE_FILES = {
     "gateway/run.py": "gateway_run", "gateway/run_shutdown.py": "gateway_run_shutdown",
@@ -26,7 +27,14 @@ DIAGNOSTIC_CORE_FILES = {
     "hermes_constants_scratch.py": "scratch", "hermes_constants_scratch_detach.py": "scratch_detach",
     "tui_gateway/git_probe.py": "tui_git_probe", "run_agent.py": "run_agent",
 }
-DIAGNOSTIC_CALLSITES = frozenset((*DIAGNOSTIC_CORE_FILES.values(), "other"))
+DIAGNOSTIC_GATEWAY_FUNCTIONS = {
+    "_get_service_pids": "cli_gateway_service_pids", "_get_parent_pid": "cli_gateway_parent_pid",
+    "_scan_gateway_pids": "cli_gateway_scan_pids", "_run_systemctl": "cli_gateway_systemctl",
+    "_launchd_print_service_pid": "cli_gateway_launchd_print", "_launchd_service_registered": "cli_gateway_launchd_registered",
+    "get_systemd_linger_status": "cli_gateway_linger_status", "_loginctl_enable_linger": "cli_gateway_linger_enable",
+    "systemd_status": "cli_gateway_systemd_status", "_spawn_gateway_restart_watcher": "cli_gateway_restart_watcher",
+}
+DIAGNOSTIC_CALLSITES = frozenset((*DIAGNOSTIC_CORE_FILES.values(), *DIAGNOSTIC_GATEWAY_FUNCTIONS.values(), "other"))
 DIAGNOSTIC_MARKER = "PHASEC_REFUSAL_DIAGNOSTIC"
 
 
@@ -54,7 +62,8 @@ def mismatch_diagnostic(executable: object, argv0: object, python: str, core: Pa
     for frame in reversed(frames):
         for path, token in DIAGNOSTIC_CORE_FILES.items():
             if frame.filename == str(core / path):
-                callsite = token
+                callsite = (DIAGNOSTIC_GATEWAY_FUNCTIONS.get(frame.name, token)
+                            if token == "cli_gateway" else token)
                 break
         if callsite != "other":
             break

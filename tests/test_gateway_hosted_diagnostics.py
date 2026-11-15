@@ -21,6 +21,11 @@ def test_mismatch_classifies_without_raw_values():
     # A suffix match is not an official Core frame.
     frames = [SimpleNamespace(filename='/other/hermes_cli/version_info.py')]
     assert mismatch_diagnostic('/bin/uname', '/bin/uname', '/python', core, frames)[2] == 'other'
+    frames = [SimpleNamespace(filename='/private/core/hermes_cli/gateway.py', name='_get_service_pids')]
+    assert mismatch_diagnostic('systemctl', 'systemctl', '/python', core, frames) == (
+        'systemctl', 'unapproved_executable', 'cli_gateway_service_pids')
+    frames[0].name = 'secret'
+    assert mismatch_diagnostic('systemctl', 'systemctl', '/python', core, frames)[2] == 'cli_gateway'
 
 
 def test_audit_to_host_filters_every_untrusted_field(tmp_path):
