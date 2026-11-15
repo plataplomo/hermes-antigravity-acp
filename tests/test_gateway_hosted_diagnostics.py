@@ -2,6 +2,11 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from scripts import gateway_process_policy as policy
 
 from scripts.gateway_docker import sanitized_diagnostics
 from scripts.gateway_e2e import refusal_diagnostics
@@ -54,3 +59,51 @@ def test_audit_to_host_filters_every_untrusted_field(tmp_path):
                    'PHASEC_REFUSAL_DIAGNOSTIC uname unapproved_executable cli_version_info /secret\n')
     assert sanitized_diagnostics(log) == {tuple(good)}
     assert safe_diagnostic(['uname', 'unapproved_executable', '/private/secret']) is None
+
+
+@pytest.mark.parametrize('command', [
+    ['systemctl', 'is-system-running'], ['systemctl', '--user', 'is-system-running'],
+])
+def test_systemctl_status_exact_commands_and_context(tmp_path, command):
+    root = tmp_path.resolve()
+    runtime = root / 'runtime'
+    runtime.mkdir()
+    env = {'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': str(runtime)}
+    exists = policy.os.path.lexists
+
+    def no_host_bus(path):
+        return False if str(path).startswith('/run/') else exists(path)
+
+    with patch.object(policy.os.path, 'lexists', side_effect=no_host_bus), patch.object(
+        policy.shutil, 'which', return_value='/usr/bin/systemctl'), patch.object(
+        policy, '_trusted_systemctl', return_value=True):
+        def check(c=command, e=env, b=env, **kw):
+            return policy.systemctl_status_verdict(
+                kw.get('executable', 'systemctl'), c, kw.get('cwd', root), e, root,
+                kw.get('confined', True), baseline=b)
+        assert check()
+        for verb in ('start', 'stop', 'restart', 'daemon-reload', 'enable', 'reset-failed', 'show', 'is-active'):
+            assert not check(['systemctl', verb])
+        for option in ('--host=elsewhere', '--machine=x', '--root=/', '--no-pager'):
+            assert not check(['systemctl', option, 'is-system-running'])
+        assert not check(['systemctl', 'is-system-running', 'extra'])
+        assert not check(executable='/tmp/systemctl')
+        assert not check(confined=False)
+        assert not check(cwd=runtime)
+        for key in ('PATH', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DBUS_SESSION_BUS_ADDRESS',
+                    'DBUS_SYSTEM_BUS_ADDRESS', 'SYSTEMD_BUS_ADDRESS'):
+            assert not check(e={**env, key: 'untrusted'})
+        assert not check(e={k: v for k, v in env.items() if k != 'PATH'})
+        (runtime / 'bus').touch()
+        assert not check()
+
+
+def test_systemctl_status_refuses_wrong_binary(tmp_path):
+    root = tmp_path.resolve()
+    (root / 'runtime').mkdir()
+    env = {'PATH': '/tmp', 'XDG_RUNTIME_DIR': str(root / 'runtime')}
+    with patch.object(policy.os.path, 'lexists', return_value=False), patch.object(
+        policy.shutil, 'which', return_value='/tmp/systemctl'), patch.object(
+        policy, '_trusted_systemctl', return_value=False):
+        assert not policy.systemctl_status_verdict('systemctl', ['systemctl', 'is-system-running'],
+                                                   root, env, root, True, baseline=env)

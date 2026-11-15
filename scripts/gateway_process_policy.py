@@ -10,6 +10,7 @@ import ast
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 from typing import Sequence
 
@@ -505,6 +506,49 @@ def git_probe_context_verdict(command: Sequence[str], core: Path, cwd, env,
     if _effective_config_exec_capable(child, repo):
         return "git_effective_config_exec_capable"
     return ""
+
+
+def _trusted_systemctl(path: str) -> bool:
+    """The immutable, root-owned runner executable, never a same-named shim."""
+    try:
+        target = Path(path).resolve(strict=True)
+        expected = Path("/usr/bin/systemctl").resolve(strict=True)
+        info = target.stat()
+        return target == expected and info.st_uid == 0 and stat.S_ISREG(info.st_mode) and not info.st_mode & 0o022
+    except (OSError, RuntimeError):
+        return False
+
+
+def systemctl_status_verdict(executable, command, cwd, env, root: Path, confined: bool, *, baseline=None) -> bool:
+    """Admit only the two observed Core status probes in the verified container.
+
+    Child audit hooks are not inherited. Network/bus isolation relies on the verified
+    Docker boundary; the fixture has no system bus and refuses any local bus endpoint.
+    """
+    if (not confined or executable != "systemctl" or not isinstance(command, list)
+            or command not in (["systemctl", "is-system-running"], ["systemctl", "--user", "is-system-running"])):
+        return False
+    if env is not None and (not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in env.items())):
+        return False
+    child = dict(os.environ) if env is None else env
+    ambient = BASELINE_ENV if baseline is None else baseline
+    if child != ambient or any(name.startswith("SYSTEMD_") or name.startswith("DBUS_")
+                               or name in {"LD_PRELOAD", "LD_LIBRARY_PATH"} for name in child):
+        return False
+    try:
+        if Path(cwd if cwd is not None else os.getcwd()).resolve(strict=True) != root:
+            return False
+        runtime = root / "runtime"
+        if child.get("XDG_RUNTIME_DIR") != str(runtime) or runtime.resolve(strict=True) != runtime:
+            return False
+        if any(os.path.lexists(path) for path in (runtime / "bus", runtime / "systemd" / "private",
+                                                  "/run/dbus/system_bus_socket", "/run/systemd/private")):
+            return False
+        resolved = shutil.which("systemctl", path=child.get("PATH", ""))
+        return resolved is not None and _trusted_systemctl(resolved)
+    except (OSError, TypeError, ValueError, RuntimeError):
+        return False
 
 
 def canonical_owned_path(value: str, root: Path) -> Path | None:
