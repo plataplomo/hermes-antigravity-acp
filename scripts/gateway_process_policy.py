@@ -234,16 +234,21 @@ def _config_text_exec_capable(text: str) -> bool:
         if not line or line.startswith(("#", ";")):
             continue
         if line.startswith("["):
-            # git accepts a comment after the closing bracket, so the header ends at the
-            # first ']' and the remainder of the line is not part of the section name.
+            # git ends the header at the first ']' -- and then keeps parsing the *same line*
+            # as an assignment. Reproduced against real git: a single line
+            # `[core] fsmonitor = <hook>` is a setting git reports and executes, while a parser
+            # that consumed only the header saw an inert file. A comment after the bracket is
+            # still just a comment.
             end = line.find("]")
             parsed = _config_section_header(line[1:end]) if end > 0 else None
             if parsed is None:
                 return True  # git rejects this file too; refuse rather than guess a section
             section = parsed
-            continue
+            line = line[end + 1:].lstrip()
+            if not line or line.startswith(("#", ";")):
+                continue
         if "=" not in line:
-            continue
+            return True  # git rejects this line too; refuse rather than guess what it sets
         option, _, value = line.partition("=")
         name = f"{section}.{option.strip().lower()}"
         value = value.strip().strip('"')
