@@ -29,10 +29,12 @@ import urllib.request
 try:
     import deploy_hermes_profiles as deployment
     from gateway_docker import namespace_verified, validate_confinement
+    from gateway_process_policy import DIAGNOSTIC_MARKER, safe_diagnostic
     from provider_origin import ProviderOrigin
 except ImportError:
     from scripts import deploy_hermes_profiles as deployment
     from scripts.gateway_docker import namespace_verified, validate_confinement
+    from scripts.gateway_process_policy import DIAGNOSTIC_MARKER, safe_diagnostic
     from scripts.provider_origin import ProviderOrigin
 
 REQUIRED_STAGES = (
@@ -41,6 +43,24 @@ REQUIRED_STAGES = (
     "ownership_conflict", "owner_survives", "shutdown", "child_cleanup", "source_unchanged",
 )
 HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def refusal_diagnostics(root: Path) -> set[tuple[str, str, str]]:
+    """Read the private audit file but return only fixed, allowlisted tokens."""
+    try:
+        with (root / "audit-refusals.jsonl").open(encoding="utf-8") as stream:
+            found = set()
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                    diagnostic = safe_diagnostic(row.get("diagnostic")) if isinstance(row, dict) else None
+                    if row.get("reason") == "subprocess_executable_mismatch" and diagnostic:
+                        found.add(diagnostic)
+                except (ValueError, AttributeError):
+                    continue
+            return found
+    except OSError:
+        return set()
 
 
 def boundary_refusal_reasons(envelopes: list[dict]) -> list[str]:
@@ -577,6 +597,8 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(directory).resolve()
         run = Run(core, repo, root, args.candidate_sha, args.timeout)
         result = run.execute()
+        for diagnostic in sorted(refusal_diagnostics(root)):
+            print(DIAGNOSTIC_MARKER, *diagnostic, flush=True)
         clean = (clean and _git(repo, "rev-parse", "HEAD") == args.candidate_sha
                  and not _git(repo, "status", "--porcelain", "--untracked-files=normal"))
         result["candidate_source_dirty"] = not clean
@@ -584,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
         result["run_attempt"] = os.environ.get("GITHUB_RUN_ATTEMPT", "local")
         result["driver_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         result["hermes_tree"] = _git(core, "rev-parse", "HEAD^{tree}")
-        result["execution"] = {"python": sys.executable, "entry": "scripts/gateway_e2e.py", "cli": "hermes gateway run --no-supervise"}
+        result["execution"] = {"python": "redacted", "entry": "scripts/gateway_e2e.py", "cli": "hermes gateway run --no-supervise"}
         if not clean:
             result["status"] = "FAIL"
         args.output.parent.mkdir(parents=True, exist_ok=True)
