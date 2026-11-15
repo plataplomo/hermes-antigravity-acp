@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -123,7 +124,7 @@ class ChildLedgerTests(unittest.TestCase):
         for argv in (self.scratch_argv(), self.shutdown_argv()):
             self.ledger.observe(_FakePopen(4108, argv))
         self.assertEqual([], self.ledger.housekeeping())
-        self.assertEqual([], self.ledger._verified_launches)
+        self.assertIsNone(getattr(self.ledger._pending, "slot", None))
 
     def test_live_child_without_start_identity_is_refused(self):
         def gone(pid):
@@ -134,6 +135,104 @@ class ChildLedgerTests(unittest.TestCase):
         self.assertNotIn(4109, ledger.owned_pids)
         self.assertEqual([], self.observations())  # refusal happens before the evidence line
 
+    def test_unreadable_start_identity_is_a_refusal_not_a_foreign_exception(self):
+        # /proc can fail with anything OSError-shaped (hidepid, EPERM, a race). The profile
+        # hook only converts _ChildIdentityUnavailable into a boundary refusal: any other
+        # type would propagate into the Gateway's own Popen.__init__ and corrupt that launch
+        # without ever recording a refusal.
+        for error in (PermissionError(13), ProcessLookupError(3), OSError(5)):
+            with self.subTest(error=type(error).__name__):
+                def boom(pid, error=error):
+                    raise error
+                ledger = envelope._ChildLedger(self.root, start_time=boom)
+                with self.assertRaises(envelope._ChildIdentityUnavailable):
+                    ledger.observe(_FakePopen(4120, self.scratch_argv(), returncode=None))
+                self.assertEqual([], self.observations())
+
+    def test_admitted_child_we_cannot_track_never_vanishes_from_evidence(self):
+        # A Popen-shaped child with an unusable pid is invisible to the driver's cleanup
+        # stage, so a live one would leave child_cleanup PASSing over a smaller pid set.
+        for bad in (_FakePopen(None, self.scratch_argv()), _FakePopen("4121", self.scratch_argv()),
+                    _FakePopen(-1, self.scratch_argv())):
+            with self.subTest(pid=repr(bad.pid)):
+                with self.assertRaises(envelope._ChildIdentityUnavailable):
+                    self.ledger.observe(bad)
+        self.assertEqual([], self.observations())
+
+    def test_non_process_objects_are_not_observed(self):
+        for process in (None, object()):
+            with self.subTest(process=type(process).__name__):
+                self.assertIsNone(self.ledger.observe(process))
+        self.assertEqual([], self.observations())
+        self.assertEqual({}, self.ledger.owned_pids)
+
+    def test_verified_token_never_authorizes_a_different_launch_attempt(self):
+        # The audit hook notes the token before the child exists. If that Popen then raised,
+        # the token must not survive to classify some later child carrying the same argv.
+        argv = self.scratch_argv()
+        self.ledger.note_verified_launch("scratch", argv)
+        self.ledger.begin_launch_attempt()  # this attempt failed to spawn
+        self.assertEqual("other", self.ledger.observe(_FakePopen(4122, argv))["kind"])
+        self.assertEqual([], self.ledger.housekeeping())
+
+    def test_verified_token_is_bound_to_the_noting_thread(self):
+        argv = self.scratch_argv()
+        self.ledger.note_verified_launch("scratch", argv)
+        seen = {}
+
+        def other_thread():
+            seen["kind"] = self.ledger.observe(_FakePopen(4123, argv))["kind"]
+
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        thread.join(10)
+        self.assertEqual("other", seen["kind"])
+        self.assertEqual([], self.ledger.housekeeping())
+
+    def test_two_threads_launching_the_same_argv_each_keep_their_own_evidence(self):
+        argv = self.scratch_argv()
+        results, errors = {}, []
+        barrier = threading.Barrier(2, timeout=10)
+
+        def worker(name, pid):
+            try:
+                self.ledger.note_verified_launch("scratch", argv)
+                barrier.wait()
+                results[name] = self.ledger.observe(_FakePopen(pid, argv))["kind"]
+            except BaseException as exc:  # surfaced as a failure, never swallowed
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(n, p))
+                   for n, p in (("a", 4124), ("b", 4125))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual([], errors)
+        self.assertEqual({"a": "scratch", "b": "scratch"}, results)
+        self.assertEqual(2, len(self.ledger.housekeeping()))
+
+    def test_unverified_launch_attempt_clears_a_stale_token_on_the_same_thread(self):
+        argv = self.scratch_argv()
+        self.ledger.note_verified_launch("scratch", argv)
+        self.ledger.begin_launch_attempt()
+        # A later, unrelated admitted launch on this thread must clear the slot.
+        self.ledger.begin_launch_attempt()
+        self.assertEqual("other", self.ledger.observe(_FakePopen(4126, argv))["kind"])
+        self.assertEqual([], self.ledger.housekeeping())
+
+    def test_one_verified_launch_authorizes_exactly_one_child_of_identical_argv(self):
+        # The audit hook notes the token and the profile hook consumes it inside one
+        # synchronous Popen call stack, so no scheduler (thread or asyncio task) can interleave
+        # a second launch between them. Whatever the scheduling, a token is single-use: a
+        # second child carrying the same argv is unclassified rather than sharing the receipt.
+        argv = self.scratch_argv()
+        self.ledger.begin_launch_attempt()
+        self.ledger.note_verified_launch("scratch", argv)
+        self.assertEqual("scratch", self.ledger.observe(_FakePopen(4127, argv))["kind"])
+        self.assertEqual("other", self.ledger.observe(_FakePopen(4128, argv))["kind"])
+        self.assertEqual(1, len(self.ledger.housekeeping()))
+
     def test_exited_child_without_start_identity_is_still_recorded(self):
         def gone(pid):
             raise FileNotFoundError(pid)
@@ -143,13 +242,9 @@ class ChildLedgerTests(unittest.TestCase):
         self.assertNotIn(4110, ledger.owned_pids)
         self.assertEqual(1, len(self.observations()))
 
-    def test_malformed_process_objects_are_not_observed(self):
-        for process in (None, object(), _FakePopen(None, ["x"]), _FakePopen("7", ["x"])):
-            with self.subTest(process=type(process).__name__):
-                self.assertIsNone(self.ledger.observe(process))
-        self.assertEqual([], self.observations())
-        self.assertEqual({}, self.ledger.owned_pids)
-        # A live pid with a malformed command is observed as unclassified, not a crash.
+    def test_unreadable_command_is_observed_as_unclassified_not_dropped(self):
+        # A live pid whose argv cannot be decoded is still an owned child: it must appear
+        # in the evidence as unclassified rather than vanish from the cleanup pid set.
         record = self.ledger.observe(_FakePopen(4111, None))
         self.assertEqual("other", record["kind"])
         self.assertEqual([], self.ledger.housekeeping())
