@@ -18,7 +18,10 @@ from typing import Sequence
 DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "uname", "which", "ps", "rg",
                                     "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "systemctl",
                                     "loginctl", "launchctl", "journalctl", "systemctl_status_user",
-                                    "systemctl_status_system", "other"})
+                                    "systemctl_status_system", "systemctl_block_shape", "systemctl_block_env_type",
+                                    "systemctl_block_path", "systemctl_block_env", "systemctl_block_env_unsafe",
+                                    "systemctl_block_cwd", "systemctl_block_runtime", "systemctl_block_bus",
+                                    "systemctl_block_binary", "systemctl_block_error", "other"})
 DIAGNOSTIC_MISMATCHES = frozenset({"executable_argv0", "unapproved_executable", "both"})
 DIAGNOSTIC_CORE_FILES = {
     "gateway/run.py": "gateway_run", "gateway/run_shutdown.py": "gateway_run_shutdown",
@@ -519,49 +522,55 @@ def _trusted_systemctl(path: str) -> bool:
         return False
 
 
-def systemctl_status_verdict(executable, command, cwd, env, root: Path, confined: bool, *, baseline=None) -> bool:
-    """Admit only the two observed Core status probes in the verified container.
+def systemctl_status_reason(executable, command, cwd, env, root: Path, confined: bool, *, baseline=None) -> str:
+    """Fixed refusal class for the two observed Core probes; empty means admitted.
 
     Child audit hooks are not inherited. Network/bus isolation relies on the verified
     Docker boundary; the fixture has no system bus and refuses any local bus endpoint.
     """
     if (not confined or executable != "systemctl" or not isinstance(command, list)
             or command not in (["systemctl", "is-system-running"], ["systemctl", "--user", "is-system-running"])):
-        return False
+        return "shape"
     if env is not None and (not isinstance(env, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in env.items())):
-        return False
+        return "env_type"
     child = dict(os.environ) if env is None else env
     ambient = BASELINE_ENV if baseline is None else baseline
     # Core gateway.py appends missing standard service-search paths on import.
     # Permit only that deterministic suffix, then independently pin the resolved binary.
     baseline_path = ambient.get("PATH")
     if not isinstance(baseline_path, str):
-        return False
+        return "path"
     missing = {"/bin", "/usr/bin", "/usr/sbin", "/sbin"} - set(baseline_path.split(os.pathsep))
     core_path = baseline_path + os.pathsep + os.pathsep.join(sorted(missing)) if missing else baseline_path
     if (child.get("PATH") not in {baseline_path, core_path}
-            or any(not item or not os.path.isabs(item) for item in child["PATH"].split(os.pathsep))
-            or {k: v for k, v in child.items() if k != "PATH"} != {k: v for k, v in ambient.items() if k != "PATH"}
-            or any(name.startswith("SYSTEMD_") or name.startswith("DBUS_")
-                   or name in {"LD_PRELOAD", "LD_LIBRARY_PATH"} for name in child)):
-        return False
+            or any(not item or not os.path.isabs(item) for item in child["PATH"].split(os.pathsep))):
+        return "path"
+    if {k: v for k, v in child.items() if k != "PATH"} != {k: v for k, v in ambient.items() if k != "PATH"}:
+        return "env"
+    if any(name.startswith("SYSTEMD_") or name.startswith("DBUS_")
+           or name in {"LD_PRELOAD", "LD_LIBRARY_PATH"} for name in child):
+        return "env_unsafe"
     try:
         # PATH entries inside the writable fixture cannot be trusted between audit and exec.
         if any(Path(item).resolve().is_relative_to(root) for item in child["PATH"].split(os.pathsep)):
-            return False
+            return "path"
         if Path(cwd if cwd is not None else os.getcwd()).resolve(strict=True) != root:
-            return False
+            return "cwd"
         runtime = root / "runtime"
         if child.get("XDG_RUNTIME_DIR") != str(runtime) or runtime.resolve(strict=True) != runtime:
-            return False
+            return "runtime"
         if any(os.path.lexists(path) for path in (runtime / "bus", runtime / "systemd" / "private",
                                                   "/run/dbus/system_bus_socket", "/run/systemd/private")):
-            return False
+            return "bus"
         resolved = shutil.which("systemctl", path=child.get("PATH", ""))
-        return resolved is not None and _trusted_systemctl(resolved)
+        return "" if resolved is not None and _trusted_systemctl(resolved) else "binary"
     except (OSError, TypeError, ValueError, RuntimeError):
-        return False
+        return "error"
+
+
+def systemctl_status_verdict(executable, command, cwd, env, root: Path, confined: bool, *, baseline=None) -> bool:
+    return not systemctl_status_reason(executable, command, cwd, env, root, confined, baseline=baseline)
 
 
 def canonical_owned_path(value: str, root: Path) -> Path | None:

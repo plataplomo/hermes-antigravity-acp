@@ -82,6 +82,12 @@ def test_systemctl_status_exact_commands_and_context(tmp_path, command):
                 kw.get('executable', 'systemctl'), c, kw.get('cwd', root), e, root,
                 kw.get('confined', True), baseline=b)
         assert check()
+        assert policy.systemctl_status_reason('systemctl', command, root, {**env, 'SECRET': 'value'},
+                                              root, True, baseline=env) == 'env'
+        assert safe_diagnostic(('systemctl_block_env', 'unapproved_executable',
+                                'cli_gateway_systemd_operational')) is not None
+        assert safe_diagnostic(('systemctl_block_SECRET', 'unapproved_executable',
+                                'cli_gateway_systemd_operational')) is None
         # The official Core gateway module appends these exact missing system dirs
         # at import time; the resolved executable must still be pinned below.
         core_path = env['PATH'] + ':/sbin:/usr/sbin'
