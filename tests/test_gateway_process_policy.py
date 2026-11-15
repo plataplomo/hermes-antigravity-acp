@@ -313,6 +313,35 @@ class GitProbeContextTests(unittest.TestCase):
                 self.assertEqual("git_effective_config_exec_capable",
                                  self.verdict(["rev-parse", "HEAD"], cwd=self.core))
 
+    def test_assignment_on_the_section_header_line_is_still_parsed(self):
+        # git keeps parsing the same line after the header's closing bracket. Reproduced
+        # against real git: a single `[core] fsmonitor = <hook>` line is reported by
+        # `git config --get core.fsmonitor` and executed by the admitted read-only probe,
+        # while a parser that consumed only the header rated the file inert. The same blind
+        # spot hid the one-line `[include] path = <file>` form the include rule denies.
+        config = self.core / ".git" / "config"
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, "utf-8")
+        for label, line in (("fsmonitor", "[core] fsmonitor = /tmp/planted-fsmonitor"),
+                            ("pager", "[core] pager = /tmp/planted-pager"),
+                            ("include", "[include] path = /tmp/planted-include"),
+                            ("no-space", "[core]fsmonitor=/tmp/planted-fsmonitor")):
+            with self.subTest(form=label):
+                config.write_text(original + line + "\n", encoding="utf-8")
+                self.assertEqual("git_effective_config_exec_capable",
+                                 self.verdict(["--no-optional-locks", "status", "--porcelain"],
+                                              cwd=self.core))
+                config.write_text(original, encoding="utf-8")
+
+    def test_a_line_git_cannot_parse_is_refused_not_ignored(self):
+        config = self.core / ".git" / "config"
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, "utf-8")
+        config.write_text(original + "[core]\n\tfsmonitor\n", encoding="utf-8")
+        self.assertEqual("git_effective_config_exec_capable",
+                         self.verdict(["--no-optional-locks", "status", "--porcelain"],
+                                      cwd=self.core))
+
     def test_linked_worktree_common_and_worktree_configs_are_scanned(self):
         # A linked worktree has no <gitdir>/config at all: git loads the common dir's config
         # (named by the gitdir's `commondir` file) plus <gitdir>/config.worktree when

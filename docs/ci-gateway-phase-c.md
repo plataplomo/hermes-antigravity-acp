@@ -267,10 +267,15 @@ own override names with Core's own values. Repository-level config resolution fo
 worktree to what git actually reads: a worktree has no `<gitdir>/config`, so scanning only that
 path admitted a probe whose *common* config (`<commondir>/config`, named by the gitdir's
 `commondir` file) carried `core.fsmonitor`, and the admitted read-only status probe executed it
-against real git; `<commondir>/config` and `<gitdir>/config.worktree` are now both scanned. These
-controls bound which binary, repository and configuration a probe can reach. They do not make git
-incapable of writing inside the disposable root, and the read-only container mount, not this
-policy, is what bounds where such a write can land.
+against real git; `<commondir>/config` and `<gitdir>/config.worktree` are now both scanned. A
+third round closed the header line itself: git ends a section header at the first `]` and then
+keeps parsing the *same line* as an assignment, so a single `[core] fsmonitor = <hook>` line is a
+setting `git config --get` reports and the admitted read-only probe executes, while a parser that
+consumed only the header rated the file inert; the same blind spot hid the one-line
+`[include] path = <file>` form the include rule exists to deny. A line git itself cannot parse is
+now refused rather than skipped. These controls bound which binary, repository and configuration
+a probe can reach. They do not make git incapable of writing inside the disposable root, and the
+read-only container mount, not this policy, is what bounds where such a write can land.
 
 Child observation is bound to the launch that earned it. The audit hook clears a per-thread
 slot for every admitted `Popen` and writes a housekeeping verdict into it only after a full
