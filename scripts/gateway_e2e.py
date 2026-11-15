@@ -61,6 +61,10 @@ def validate_receipt(receipt: object, candidate: str) -> list[str]:
         problems.append("invalid_schema")
     if not isinstance(receipt.get("boundary_refusal_reasons"), list):
         problems.append("boundary_refusals_unrecorded")
+    elif receipt["boundary_refusal_reasons"]:
+        # Real executions force isolation BLOCKED sticky_boundary_refusal on any recorded
+        # denial, so a non-empty enum alongside all-PASS stages is contradictory evidence.
+        problems.append("boundary_refusal_contradicts_pass")
     if receipt.get("candidate_sha") != candidate or not HEX40.fullmatch(candidate):
         problems.append("candidate_identity_mismatch")
     if not isinstance(receipt.get("hermes_commit"), str) or not HEX40.fullmatch(receipt["hermes_commit"]):
@@ -78,6 +82,14 @@ def validate_receipt(receipt: object, candidate: str) -> list[str]:
     if (not isinstance(diagnostic, dict) or diagnostic.get("status") != "PASS"
             or type(diagnostic.get("launch_count")) is not int or diagnostic["launch_count"] < 1):
         problems.append("shutdown_diagnostic_not_pass")
+    owned = receipt.get("owned_child_count")
+    if type(owned) is not int or owned < 1:
+        # An empty owned-pid set makes child_cleanup pass vacuously; PASS needs observed count >= 1.
+        problems.append("owned_child_count_not_observed")
+    live = receipt.get("live_owned_children_after_exit")
+    if type(live) is not int or live != 0:
+        # Exact-int typing: bools and floats equal zero; negatives and residuals are contradictions.
+        problems.append("live_owned_children_not_zero")
     origin = receipt.get("provider_origin")
     if (not isinstance(origin, dict) or origin.get("status") != "PASS" or origin.get("candidate_sha") != candidate
             or origin.get("errors") != [] or type(origin.get("frozen_copies")) is not int or origin["frozen_copies"] < 0
@@ -489,7 +501,7 @@ class Run:
         deadline = time.monotonic() + 6  # Core's original shutdown diagnostic is bounded to 5s.
         while any(_live(pid, token) for pid, token in pids.items()) and time.monotonic() < deadline:
             time.sleep(0.1)
-        clean = not any(_live(pid, token) for pid, token in pids.items())
+        clean = bool(pids) and not any(_live(pid, token) for pid, token in pids.items())
         self.record["owned_child_count"] = len(pids)
         self.record["live_owned_children_after_exit"] = sum(_live(pid, token) for pid, token in pids.items())
         boundary_ok = True
@@ -527,7 +539,11 @@ class Run:
         if self.process is not None:
             success = self.process.returncode == 0 and not forced and diagnostic_ok
             self.record["stages"]["shutdown"] = {"status": "PASS" if success else "FAIL", "detail": "graceful_exit_and_original_diagnostic" if success else "unclean_exit_or_missing_diagnostic"}
-        self.record["stages"]["child_cleanup"] = {"status": "PASS" if clean and not forced else "FAIL", "detail": "no_live_owned_children" if clean and not forced else "residual_or_forced_cleanup"}
+        self.record["stages"]["child_cleanup"] = {
+            "status": "PASS" if clean and not forced else "FAIL",
+            "detail": ("no_live_owned_children" if clean and not forced
+                       else "no_owned_child_process_evidence" if not pids
+                       else "residual_or_forced_cleanup")}
 
 
 def main(argv: list[str] | None = None) -> int:

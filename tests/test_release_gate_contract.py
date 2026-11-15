@@ -226,6 +226,7 @@ def _results(matrix, *, candidate=CANDIDATE, **overrides) -> dict:
         "gateway_core": "b" * 40, "gateway_result": "success", "gateway_record": json.dumps({
             "schema_version": 2, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
             "boundary_refusal_reasons": [],
+            "owned_child_count": 2, "live_owned_children_after_exit": 0,
             "candidate_source_dirty": False,
             "provider_origin": {"status": "PASS", "candidate_sha": candidate, "tree_sha256": "3" * 64,
                                 "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},

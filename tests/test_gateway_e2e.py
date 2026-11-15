@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from scripts.gateway_docker import CHECKS
@@ -13,6 +18,7 @@ class GatewayEvidenceTests(unittest.TestCase):
     def receipt(self):
         return {"schema_version": 2, "status": "PASS", "candidate_sha": "a" * 40,
                 "boundary_refusal_reasons": [],
+                "owned_child_count": 2, "live_owned_children_after_exit": 0,
                 "hermes_commit": "b" * 40, "candidate_source_dirty": False,
                 "provider_origin": {"status": "PASS", "candidate_sha": "a" * 40, "tree_sha256": "3" * 64,
                                     "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
@@ -136,6 +142,102 @@ class GatewayEvidenceTests(unittest.TestCase):
             bad = deepcopy(receipt)
             bad["stages"][stage] = {"status": "FAIL", "detail": "synthetic_negative"}
             self.assertTrue(gateway.validate_receipt(bad, "a" * 40))
+
+    def test_recorded_boundary_refusal_denies_success(self):
+        # A PASS receipt can never coexist with recorded denials: cleanup() forces
+        # isolation BLOCKED sticky_boundary_refusal, so any non-empty enum is forged.
+        for reasons in (["unapproved_subprocess"], ["subprocess_executable_mismatch"],
+                        ["mutation_outside_disposable_root", "unapproved_subprocess"]):
+            with self.subTest(reasons=reasons):
+                receipt = self.receipt()
+                receipt["boundary_refusal_reasons"] = reasons
+                self.assertIn("boundary_refusal_contradicts_pass",
+                              gateway.validate_receipt(receipt, "a" * 40))
+
+    def test_live_owned_children_must_be_exact_int_zero(self):
+        # bools and floats equal zero; only exact-int typing plus the zero gate holds.
+        for bad in (1, 3, -1, True, False, 0.0, "0", None):
+            with self.subTest(live=bad):
+                receipt = self.receipt()
+                receipt["live_owned_children_after_exit"] = bad
+                self.assertIn("live_owned_children_not_zero", gateway.validate_receipt(receipt, "a" * 40))
+        missing = self.receipt()
+        del missing["live_owned_children_after_exit"]
+        self.assertIn("live_owned_children_not_zero", gateway.validate_receipt(missing, "a" * 40))
+
+    def test_owned_child_count_requires_observed_process_evidence(self):
+        # An empty owned-pid set makes child_cleanup pass vacuously; PASS needs count >= 1.
+        for bad in (0, -1, True, False, 1.0, "2", None):
+            with self.subTest(owned=bad):
+                receipt = self.receipt()
+                receipt["owned_child_count"] = bad
+                self.assertIn("owned_child_count_not_observed", gateway.validate_receipt(receipt, "a" * 40))
+        missing = self.receipt()
+        del missing["owned_child_count"]
+        self.assertIn("owned_child_count_not_observed", gateway.validate_receipt(missing, "a" * 40))
+
+    def test_schema_three_extension_is_rejected(self):
+        # No schema extension: schema 3 (refusal-spawn fingerprints) never validates here.
+        receipt = self.receipt()
+        receipt["schema_version"] = 3
+        receipt["boundary_refusal_spawns"] = []
+        self.assertIn("invalid_schema", gateway.validate_receipt(receipt, "a" * 40))
+
+
+class GatewayCleanupObservationTests(unittest.TestCase):
+    """cleanup() must never promote an empty owned-child observation to success."""
+
+    def run_object(self, root: Path):
+        run = object.__new__(gateway.Run)
+        run.contender = run.process = None
+        run.root = root
+        run.home = root / "hermes"
+        run.profile = root / "hermes" / "profiles" / "phasec"
+        run.record = {"stages": {name: {"status": "NOT_RUN", "detail": "not_executed"}
+                                 for name in gateway.REQUIRED_STAGES}}
+        return run
+
+    def test_empty_owned_child_set_never_marks_child_cleanup_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = self.run_object(Path(temp))
+            run.cleanup()
+            self.assertEqual(0, run.record["owned_child_count"])
+            self.assertEqual(0, run.record["live_owned_children_after_exit"])
+            self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+            self.assertEqual("no_owned_child_process_evidence",
+                             run.record["stages"]["child_cleanup"]["detail"])
+
+    def test_reaped_owned_child_yields_counted_zero_live_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reaped = subprocess.Popen([sys.executable, "-c", "pass"])
+            reaped.wait()
+            (root / "owned-core-children.jsonl").write_text(
+                json.dumps({"pid": reaped.pid, "started": "0"}) + "\n",
+                encoding="utf-8")
+            run = self.run_object(root)
+            run.cleanup()
+            self.assertEqual(1, run.record["owned_child_count"])
+            self.assertEqual(0, run.record["live_owned_children_after_exit"])
+            self.assertEqual("PASS", run.record["stages"]["child_cleanup"]["status"])
+
+    def test_live_owned_child_forces_fail_and_nonzero_live_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                     start_new_session=True)
+            try:
+                started = Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()[22 - 3]
+                (root / "owned-core-children.jsonl").write_text(
+                    json.dumps({"pid": child.pid, "started": started}) + "\n", encoding="utf-8")
+                run = self.run_object(root)
+                run.cleanup()  # bounded 6-second wait, then records the residual
+                self.assertEqual(1, run.record["owned_child_count"])
+                self.assertEqual(1, run.record["live_owned_children_after_exit"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+            finally:
+                child.kill()
+                child.wait()
 
 
 if __name__ == "__main__":
