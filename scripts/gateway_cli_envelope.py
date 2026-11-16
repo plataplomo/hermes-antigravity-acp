@@ -193,6 +193,10 @@ def main() -> None:
             if not writing and any(path.is_relative_to(p) for p in protected) and not any(path.is_relative_to(p) for p in allowed):
                 reject("operating_home_read")
         elif event in {"os.mkdir", "os.remove", "os.rmdir", "os.rename", "os.chmod"}:
+            # CPython supplies -1 when mkdir has no dir_fd; never resolve a
+            # dir_fd-relative mkdir against the unrelated current directory.
+            if event == "os.mkdir" and (len(args) != 3 or type(args[2]) is not int or args[2] != -1):
+                reject("mutation_outside_disposable_root")
             paths = [(args[0], args[2] if event in {"os.rename", "os.chmod"} and len(args) > 2 else args[1] if event in {"os.remove", "os.rmdir"} and len(args) > 1 else None)]
             if event == "os.rename":
                 paths.append((args[1], args[3] if len(args) > 3 else None))
