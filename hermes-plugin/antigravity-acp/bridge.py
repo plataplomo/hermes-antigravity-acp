@@ -254,10 +254,12 @@ def _reject_orphan_protocol_fragments(text: str) -> str:
         raise MalformedToolCallError(
             "Antigravity leaked an incomplete Hermes tool-result envelope.",
             unrecoverable=True,
+            reason="orphan_result",
         )
     if _ORPHAN_CALL_RE.search(text):
         raise MalformedToolCallError(
-            "Antigravity emitted an incomplete Hermes tool-call envelope."
+            "Antigravity emitted an incomplete Hermes tool-call envelope.",
+            reason="orphan_call",
         )
     return text
 
