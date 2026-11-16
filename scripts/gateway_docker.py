@@ -18,6 +18,7 @@ from pathlib import Path
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -47,10 +48,13 @@ def sanitized_diagnostics(log: Path) -> set[tuple[str, str, str]]:
 
 
 POLICY = "/phasec-policy.json"
+MASK_SOURCE = Path("/usr/lib/os-release")
+MASK_DESTINATION = "/usr/bin/systemctl"
 LIMIT = 128
 CHECKS = ("nonroot", "capabilities_empty", "no_new_privileges", "readonly_root", "pid_namespace",
           "network_namespace", "proc_inventory", "outside_read_denied", "outside_write_denied",
-          "source_write_denied", "root_write_denied", "external_connect_denied", "loopback_available")
+          "source_write_denied", "root_write_denied", "external_connect_denied", "loopback_available",
+          "systemctl_unavailable", "systemctl_mask_verified", "systemd_bus_unavailable")
 
 
 def namespace_verified() -> bool:
@@ -121,6 +125,17 @@ def mounts_for(repo: Path, core: Path) -> list[Path]:
     return result
 
 
+def mask_inputs_verified() -> bool:
+    """Only an existing root-owned, non-executable data file masks a regular binary."""
+    try:
+        source, target = MASK_SOURCE.lstat(), Path(MASK_DESTINATION).lstat()
+        return (stat.S_ISREG(source.st_mode) and source.st_uid == 0 and source.st_nlink == 1 and not source.st_mode & 0o133
+                and MASK_SOURCE.resolve(strict=True) == MASK_SOURCE
+                and stat.S_ISREG(target.st_mode) and target.st_uid == 0 and not target.st_mode & 0o022)
+    except (OSError, RuntimeError):
+        return False
+
+
 def docker_options(uid: int, gid: int, mounts: list[Path], work: Path, policy: Path) -> list[str]:
     if uid <= 0 or gid <= 0:
         raise ValueError("nonroot_identity_required")
@@ -131,7 +146,8 @@ def docker_options(uid: int, gid: int, mounts: list[Path], work: Path, policy: P
         if "," in str(source):
             raise ValueError("unsafe_mount_spelling")
         options += ["--mount", f"type=bind,src={source},dst={source},readonly"]
-    options += ["--mount", f"type=bind,src={work},dst=/gw",
+    options += ["--mount", f"type=bind,src={MASK_SOURCE},dst={MASK_DESTINATION},readonly",
+                "--mount", f"type=bind,src={work},dst=/gw",
                 "--mount", f"type=bind,src={policy},dst={POLICY},readonly"]
     return options
 
@@ -155,7 +171,8 @@ def config_checks(inspect: dict, uid: int, gid: int, mounts: list[Path], work: P
     checks["HostConfig.SecurityOpt"] = ("MISSING" if "SecurityOpt" not in host else "PASS" if isinstance(options, list)
         and any(s in ("no-new-privileges", "no-new-privileges=true") for s in options) else "MISMATCH")
     expected_mounts = {str(path): (str(path), False) for path in mounts}
-    expected_mounts.update({"/gw": (str(work), True), POLICY: (str(policy), False)})
+    expected_mounts.update({MASK_DESTINATION: (str(MASK_SOURCE), False),
+                            "/gw": (str(work), True), POLICY: (str(policy), False)})
     try:
         entries = inspect["Mounts"]
         actual_mounts = {m["Destination"]: (m["Source"], m["RW"]) for m in entries}
@@ -270,6 +287,46 @@ def run_gateway(policy: dict, boundary: dict, work: Path = Path("/gw")) -> int:
     return result
 
 
+def systemctl_mask_verified() -> bool:
+    """Bind identity, non-owner DAC and actual exec denial without altering host files."""
+    try:
+        source = MASK_SOURCE.stat()
+        paths = (MASK_DESTINATION, "/bin/systemctl", "/sbin/systemctl")
+        if (os.geteuid() == 0 or not stat.S_ISREG(source.st_mode) or source.st_uid != 0
+                or source.st_nlink != 1 or source.st_mode & 0o133):
+            return False
+        for path in paths:
+            actual = os.stat(path)
+            if ((actual.st_dev, actual.st_ino) != (source.st_dev, source.st_ino)
+                    or os.access(path, os.X_OK) or not _open_denied(path, os.O_WRONLY)):
+                return False
+            try:
+                subprocess.run([path, "is-system-running"], env={}, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False)
+            except PermissionError:
+                continue
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return False
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def system_services_unavailable() -> tuple[bool, bool]:
+    """Check both the current and Core's known service-search PATH, without changing either."""
+    path = os.environ.get("PATH", "")
+    missing = {"/bin", "/usr/bin", "/usr/sbin", "/sbin"} - set(path.split(os.pathsep))
+    core_path = path + os.pathsep + os.pathsep.join(sorted(missing)) if missing else path
+    executable_absent = all(shutil.which("systemctl", path=value) is None for value in (path, core_path))
+    bus_paths = ("/run/dbus/system_bus_socket", "/run/systemd/private", "/run/systemd/system",
+                 f"/run/user/{os.getuid()}/bus", f"/run/user/{os.getuid()}/systemd/private")
+    bus_absent = (not any(os.path.lexists(value) for value in bus_paths)
+                  and not any(key.startswith(("DBUS_", "SYSTEMD_")) for key in os.environ)
+                  and Path("/proc/1/comm").read_text().strip() != "systemd")
+    return executable_absent, bus_absent
+
+
 def inside() -> int:
     policy = json.loads(Path(POLICY).read_text())
     status = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines() if ":" in line)
@@ -281,6 +338,7 @@ def inside() -> int:
         loopback = connection.getsockname()[0] == "127.0.0.1"
     import psutil
     inventory = {p.pid for p in psutil.process_iter()}
+    systemctl_unavailable, systemd_bus_unavailable = system_services_unavailable()
     checks = {"nonroot": os.getuid() == policy["uid"] != 0 and os.getgid() == policy["gid"],
               "capabilities_empty": int(status["CapEff"].strip(), 16) == 0,
               "no_new_privileges": status["NoNewPrivs"].strip() == "1",
@@ -294,7 +352,9 @@ def inside() -> int:
               "source_write_denied": _open_denied(policy["repo"] + "/AGENTS.md", os.O_WRONLY),
               "root_write_denied": _open_denied("/etc/passwd", os.O_WRONLY),
               "external_connect_denied": external in {errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EACCES, errno.EPERM},
-              "loopback_available": loopback}
+              "loopback_available": loopback, "systemctl_unavailable": systemctl_unavailable,
+              "systemctl_mask_verified": systemctl_mask_verified(),
+              "systemd_bus_unavailable": systemd_bus_unavailable}
     boundary = {"status": "PASS" if all(checks.values()) else "FAIL", "checks": checks,
                 "pid_namespace": os.readlink("/proc/self/ns/pid"),
                 "pid_namespace_sha256": hashlib.sha256(os.readlink("/proc/self/ns/pid").encode()).hexdigest(),
@@ -308,7 +368,8 @@ def inside() -> int:
         if time.monotonic() >= deadline:
             return 1
         time.sleep(0.05)
-    if not namespace_verified():
+    if (not namespace_verified() or system_services_unavailable() != (True, True)
+            or not systemctl_mask_verified()):
         return 1
     Path("/gw/os-home").mkdir(exist_ok=True)
     return run_gateway(policy, boundary)
@@ -350,6 +411,8 @@ def main(argv: list[str] | None = None) -> int:
         if os.getuid() == 0 or os.getgid() == 0:
             raise RuntimeError("nonroot_runner_required")
         docker("version", "--format", "{{.Server.Version}}")
+        if not mask_inputs_verified():
+            raise RuntimeError("systemctl_mask_inputs_unverified")
         directory = tempfile.mkdtemp(prefix="gateway-docker-")
         root = Path(directory).resolve()
         work = root / "work"
@@ -417,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         # Preserve only the sanitized result before the private root is removed.
         args.output.write_text(json.dumps(record, indent=2) + "\n")
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-        allowed = {"hosted_docker_unavailable", "nonroot_runner_required", "image_identity_missing", "docker_config_not_verified",
+        allowed = {"hosted_docker_unavailable", "nonroot_runner_required", "systemctl_mask_inputs_unverified", "image_identity_missing", "docker_config_not_verified",
                    "container_boundary_not_ready", "owned_container_namespace_not_verified", "container_gateway_receipt_missing",
                    "container_receipt_identity_mismatch"}
         reason = str(exc) if isinstance(exc, RuntimeError) and str(exc) in allowed else type(exc).__name__
