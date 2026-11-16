@@ -493,13 +493,15 @@ class Run:
 
     def cleanup(self) -> None:
         forced = False
-        for process in (self.contender, self.process):
+        forced_reasons: set[str] = set()
+        for role, process in (("contender", self.contender), ("owner", self.process)):
             if process is not None and process.poll() is None:
                 process.send_signal(signal.SIGINT)
                 try:
                     process.wait(timeout=20)
                 except subprocess.TimeoutExpired:
                     forced = True
+                    forced_reasons.add("contender_sigint_timeout" if role == "contender" else "owner_sigint_timeout")
                     os.killpg(process.pid, signal.SIGKILL)  # only our Popen session, never a host scan
                     process.wait(timeout=5)
         for event in self.events():
@@ -509,6 +511,7 @@ class Run:
                     token = event["started" if key == "pid" else "grandchild_started"]
                     if _live(pid, token):
                         forced = True
+                        forced_reasons.add("fixture_child_alive")
                         # A fixture stop file/self-bounded peer is preferable, but never leave it alive.
                         os.kill(pid, signal.SIGTERM)
         pids = {event[key]: event["started" if key == "pid" else "grandchild_started"]
@@ -556,6 +559,10 @@ class Run:
             self.record["stages"]["isolation"] = {"status": "BLOCKED", "detail": "sticky_boundary_refusal"}
         if not scratch_ok:
             self.record["stages"]["isolation"] = {"status": "FAIL", "detail": "original_scratch_cleanup_unverified"}
+        returncode = self.process.returncode if self.process is not None else None
+        exit_class = ("unknown" if type(returncode) is not int else
+                      "zero" if returncode == 0 else "signal" if returncode < 0 else "nonzero")
+        self.record["cleanup_diagnostics"] = {"forced_reasons": sorted(forced_reasons), "owner_exit": exit_class}
         if self.process is not None:
             success = self.process.returncode == 0 and not forced and diagnostic_ok
             self.record["stages"]["shutdown"] = {"status": "PASS" if success else "FAIL", "detail": "graceful_exit_and_original_diagnostic" if success else "unclean_exit_or_missing_diagnostic"}

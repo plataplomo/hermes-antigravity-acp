@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from unittest.mock import Mock, patch
 import json
 from pathlib import Path
 import subprocess
@@ -196,6 +197,59 @@ class GatewayCleanupObservationTests(unittest.TestCase):
         run.record = {"stages": {name: {"status": "NOT_RUN", "detail": "not_executed"}
                                  for name in gateway.REQUIRED_STAGES}}
         return run
+
+    def test_cleanup_fixed_reason_records_for_each_forced_path(self):
+        events = [{"event": "server_started", "pid": 91111, "grandchild_pid": 92222,
+                   "started": "secret-start", "grandchild_started": "secret-child"}]
+        for trigger, expected in (("owner", "owner_sigint_timeout"),
+                                  ("contender", "contender_sigint_timeout"),
+                                  ("fixture", "fixture_child_alive")):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                run = self.run_object(root)
+                owner = Mock(pid=93333, returncode=0)
+                owner.poll.return_value = 0
+                run.process = owner
+                if trigger in {"owner", "contender"}:
+                    process = Mock(pid=94444, returncode=0)
+                    process.poll.return_value = None
+                    process.wait.side_effect = [subprocess.TimeoutExpired("private-command", 20), 0]
+                    setattr(run, "process" if trigger == "owner" else "contender", process)
+                run.events = Mock(return_value=events)
+                logs = run.home / "logs"
+                logs.mkdir(parents=True)
+                (logs / "gateway-shutdown-diag.log").write_text("=== end ===")
+                (root / "gateway-envelope.json").write_text(json.dumps({"refusals": [],
+                    "housekeeping": [{"kind": "shutdown"}]}))
+                live = Mock(return_value=False)
+                if trigger == "fixture":
+                    live.side_effect = [True, False, False, False, False, False, False, False]
+                with patch.object(gateway, "_live", live), patch.object(gateway.os, "kill"), \
+                     patch.object(gateway.os, "killpg"):
+                    run.cleanup()
+                self.assertEqual({"forced_reasons": [expected], "owner_exit": "zero"},
+                                 run.record["cleanup_diagnostics"])
+                self.assertEqual(0, run.record["live_owned_children_after_exit"])
+                self.assertEqual("PASS", run.record["shutdown_diagnostic"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+                encoded = json.dumps(run.record["cleanup_diagnostics"])
+                for secret in ("91111", "92222", "93333", "94444", "secret", "private-command", str(root)):
+                    self.assertNotIn(secret, encoded)
+
+    def test_cleanup_owner_exit_is_only_fixed_enum(self):
+        for returncode, expected in ((0, "zero"), (7, "nonzero"), (-9, "signal"), (None, "unknown"),
+                                     (True, "unknown")):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as temp:
+                run = self.run_object(Path(temp))
+                run.process = Mock(returncode=returncode)
+                run.process.poll.return_value = 0
+                run.cleanup()
+                self.assertEqual({"forced_reasons": [], "owner_exit": expected}, run.record["cleanup_diagnostics"])
+        with tempfile.TemporaryDirectory() as temp:
+            run = self.run_object(Path(temp))
+            run.cleanup()
+            self.assertEqual("unknown", run.record["cleanup_diagnostics"]["owner_exit"])
 
     def test_empty_owned_child_set_never_marks_child_cleanup_success(self):
         with tempfile.TemporaryDirectory() as temp:
