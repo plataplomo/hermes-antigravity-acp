@@ -3853,8 +3853,20 @@ _ACP_STOP_REASONS = frozenset(
 )
 
 # Server-reported effective model ids are surface names, but the value is
-# still server-authored: gate it to a conservative identifier shape.
+# still server-authored (and the requested id is caller-supplied): a shape
+# gate alone would echo UUIDs, OAuth tokens (ya29./ya41.) and API keys
+# (sk-/ghp_/AIza/...) verbatim. Deny credential-shaped values explicitly.
 _MODEL_SURFACE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}\Z")
+_MODEL_DENY_RE = re.compile(
+    r"(?:"
+    r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"  # UUID
+    r"|[0-9a-fA-F]{28,}"  # dashless UUID / long hex blob
+    r"|[A-Za-z0-9]{24,}"  # long unbroken blob (AIzaSy..., random key)
+    r"|(?:^|[-_.:/])ya\d+[._:/-]"  # OAuth access/refresh token prefix
+    r"|(?:^|[-_.:/])(?:sk|pk|gh[pousr]|xox[a-z]?|AIza|ASIA|AKIA)"
+    r"(?:[-_]|(?=[A-Za-z0-9]{16,}))"  # API-key shapes
+    r")"
+)
 
 
 def _classify_acp_stop_reason(payload: Any) -> str:
@@ -3869,10 +3881,30 @@ def _classify_acp_stop_reason(payload: Any) -> str:
 
 
 def _classify_model_surface(value: Any) -> str:
+    """Non-disclosing representation for a model id in the trace.
+
+    Ordinary model names are recorded verbatim so requested-vs-effective
+    substitution stays directly comparable. Anything credential-shaped or
+    otherwise unrecognizable is replaced by a request-scoped salted
+    fingerprint: irreversible, unlinkable across requests (the salt is the
+    ephemeral per-request key), yet still comparable inside the one event
+    where the requested/effective pair is written. Outside any request
+    scope there is no comparable identity to offer, so ``unrecognized``.
+    """
     text = str(value or "").strip()
     if not text:
         return "unreported"
-    return text if _MODEL_SURFACE_RE.match(text) else "unrecognized"
+    if _MODEL_SURFACE_RE.match(text) and not _MODEL_DENY_RE.search(text):
+        return text
+    request_key = _TRACE_REQUEST_KEY.get()
+    if not request_key:
+        return "unrecognized"
+    digest = hashlib.sha256(
+        f"antigravity-acp-model-surface\0{request_key}\0{text}".encode(
+            "utf-8", errors="surrogatepass"
+        )
+    ).hexdigest()
+    return "opaque:" + digest[:16]
 
 
 class AntigravityACPClient:
@@ -4969,7 +5001,11 @@ class AntigravityACPClient:
                             "turn_id_hash": activity_stats.get("turn_id_hash"),
                             "session_id_hash": activity_stats.get("session_id_hash"),
                             "requested_model": (
-                                activity_stats.get("requested_model") or "unspecified"
+                                _classify_model_surface(
+                                    activity_stats.get("requested_model")
+                                )
+                                if activity_stats.get("requested_model")
+                                else "unspecified"
                             ),
                             "effective_model": _classify_model_surface(
                                 activity_stats.get("model")

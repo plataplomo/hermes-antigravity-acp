@@ -49,8 +49,11 @@ Plugin trace — one JSONL line per event:
 * `pid` — the plugin's direct child pid (the mux pid in mux deployments).
 * `detail` — bounded classification only: elapsed ms, byte counts (UTF-8
   encoded, e.g. `prompt_text_bytes`), protocol method names, exit codes,
-  requested-vs-effective model ids (server-authored values are gated to an
-  identifier shape; anything else records `unrecognized`), `stop_reason`
+  requested-vs-effective model ids (ordinary names verbatim; credential- or
+  UUID-shaped values are replaced by a request-scoped salted fingerprint
+  `opaque:<16hex>` — irreversible and unlinkable across requests, yet
+  comparable within the one event holding the pair — or `unrecognized`
+  outside any request scope), `stop_reason`
   restricted to the ACP spec enum (`end_turn`, `max_tokens`,
   `max_turn_requests`, `refusal`, `cancelled`) with any other server string
   recorded as `unrecognized` — never verbatim, salted hashes,
