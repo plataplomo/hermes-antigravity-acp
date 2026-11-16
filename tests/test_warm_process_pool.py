@@ -20,6 +20,7 @@ import os
 import select
 import signal
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -232,39 +233,53 @@ def test_parked_fixture_natural_exit_after_owner_hard_exit(fake, tmp_path, hold_
     """Observe the real fixture and grandchild without signals; retain a writer as a negative control."""
     from scripts.gateway_e2e import _live
 
-    module, _, _ = fake
+    _, _, _ = fake
     fixture = PLUGIN_DIR.parent.parent / "scripts" / "gateway_fake_acp.py"
     events_file = tmp_path / "acp-events.jsonl"
     (tmp_path / "control.json").write_text(json.dumps({"mode": "reply", "text": "synthetic"}))
     parent, child = socket.socketpair()
     parent.settimeout(15)
-    owner = os.fork()
-    if owner == 0:
-        parent.close()
+    owner_code = '''
+import array, importlib.util, os, socket, sys
+from pathlib import Path
+plugin, root, fixture, fd, hold = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("agy_owner", Path(plugin) / "client.py", submodule_search_locations=[plugin])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+child = socket.socket(fileno=int(fd))
+child.settimeout(20)
+try:
+    client = module.AntigravityACPClient(acp_command=sys.executable, acp_args=[fixture, root], acp_cwd=root)
+    with client._session(10.0):
+        pass
+    parked = [entry["proc"] for entries in module._warm_pool.values() for entry in entries]
+    if len(parked) != 1 or parked[0].stdin is None or parked[0].poll() is not None:
+        child.sendall(b"F")
+        os._exit(1)
+    rights = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [parked[0].stdin.fileno()]))] if hold == "1" else []
+    child.sendmsg([b"R"], rights)
+    if child.recv(1) != b"G":
+        module._shutdown_warm_pool()
+        os._exit(2)
+    os._exit(0)  # Same hard-exit primitive as Core; skips the provider's atexit hook.
+except BaseException:
+    try:
+        module._shutdown_warm_pool()
+    finally:
         try:
-            client = module.AntigravityACPClient(acp_command=sys.executable,
-                acp_args=[str(fixture), str(tmp_path)], acp_cwd=str(tmp_path))
-            with client._session(10.0):
-                pass
-            parked = [entry["proc"] for entries in module._warm_pool.values() for entry in entries]
-            if len(parked) != 1 or parked[0].stdin is None or parked[0].poll() is not None:
-                child.sendall(b"F")
-                os._exit(1)
-            rights = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
-                       array.array("i", [parked[0].stdin.fileno()]))] if hold_stdin_open else []
-            child.sendmsg([b"R"], rights)
-            if child.recv(1) != b"G":
-                os._exit(2)
-            os._exit(0)  # Same hard-exit primitive as Core; skips the provider's atexit hook.
-        except BaseException:
-            try:
-                module._shutdown_warm_pool()
-            finally:
-                try:
-                    child.sendall(b"F")
-                finally:
-                    os._exit(3)
-
+            child.sendall(b"F")
+        finally:
+            os._exit(3)
+'''
+    try:
+        owner = subprocess.Popen([sys.executable, "-c", owner_code, str(PLUGIN_DIR), str(tmp_path),
+                                  str(fixture), str(child.fileno()), "1" if hold_stdin_open else "0"],
+                                 pass_fds=(child.fileno(),))
+    except BaseException:
+        parent.close()
+        child.close()
+        raise
     child.close()
     held_fd = None
     owner_reaped = False
@@ -286,12 +301,12 @@ def test_parked_fixture_natural_exit_after_owner_hard_exit(fake, tmp_path, hold_
         identities = [(event["pid"], event["started"]), (event["grandchild_pid"], event["grandchild_started"])]
         assert all(_live(pid, token) for pid, token in identities)
         parent.sendall(b"G")
-        owner_pidfd = os.pidfd_open(owner)
+        owner_pidfd = os.pidfd_open(owner.pid)
         try:
             assert select.select([owner_pidfd], [], [], 5)[0], "fixture owner did not exit within the bound"
-            waited, status = os.waitpid(owner, 0)
+            status = owner.wait(timeout=5)
             owner_reaped = True
-            assert waited == owner and os.waitstatus_to_exitcode(status) == 0
+            assert status == 0
         finally:
             os.close(owner_pidfd)
         initial_alive = tuple(_live(pid, token) for pid, token in identities)
@@ -322,13 +337,9 @@ def test_parked_fixture_natural_exit_after_owner_hard_exit(fake, tmp_path, hold_
             os.close(held_fd)
         parent.close()
         if not owner_reaped:
-            try:
-                waited, _ = os.waitpid(owner, os.WNOHANG)
-                if not waited:
-                    os.kill(owner, signal.SIGKILL)
-                    os.waitpid(owner, 0)
-            except ChildProcessError:
-                pass
+            if owner.poll() is None:
+                owner.kill()
+            owner.wait(timeout=5)
         # Only fixture-recorded identities; an observation timeout never becomes PASS.
         if not identities and events_file.exists():
             for line in events_file.read_text().splitlines():
