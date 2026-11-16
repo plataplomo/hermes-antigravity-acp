@@ -4874,6 +4874,12 @@ class AntigravityACPClient:
                         detail={
                             "turn_id_hash": activity_stats.get("turn_id_hash"),
                             "session_id_hash": activity_stats.get("session_id_hash"),
+                            "requested_model": (
+                                activity_stats.get("requested_model") or "unspecified"
+                            ),
+                            "effective_model": (
+                                activity_stats.get("model") or "unreported"
+                            ),
                             # Byte count only; prompt text is never recorded.
                             "prompt_text_bytes": sum(
                                 len(str(block.get("text") or ""))
@@ -5678,6 +5684,11 @@ class AntigravityACPClient:
             activity_stats["model"] = str(
                 effective_model or requested_model or model or "antigravity-acp"
             )
+            # Stage trace (issue #26): model ids are server-authored or
+            # caller-advertised surface names, never sensitive material; the
+            # requested-vs-effective pair distinguishes a silent model
+            # substitution from a plain slow turn.
+            activity_stats["requested_model"] = requested_model
             if session_result is not None:
                 session_result.update(
                     phase="session/prompt",

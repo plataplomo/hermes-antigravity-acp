@@ -285,6 +285,10 @@ def test_normal_lifecycle_trace(monkeypatch, tmp_path):
     prompt_event = records[2]
     assert prompt_event["detail"]["prompt_text_bytes"] > 0
     assert prompt_event["detail"]["turn_id_hash"].startswith("sha256:")
+    # Requested-vs-effective model pair distinguishes a silent model
+    # substitution from a plain slow turn (issue scope item 3).
+    assert prompt_event["detail"]["requested_model"] == "unspecified"
+    assert prompt_event["detail"]["effective_model"] == "gemini-3.8-flash"
     response_event = records[4]
     assert response_event["detail"]["outcome"] == "completed"
     assert response_event["detail"]["stop_reason"] == "end_turn"
