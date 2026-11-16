@@ -28,7 +28,8 @@ Plugin trace — one JSONL line per event:
 
 ```json
 {"t_mono": 12.345, "stage": "prompt_sent", "req_key": "sha256:…", "pid": 4711,
- "detail": {"turn_id_hash": "sha256:…", "prompt_text_bytes": 8123}}
+ "detail": {"turn_id_hash": "sha256:…", "requested_model": "unspecified",
+            "effective_model": "gemini-3.8-flash", "prompt_text_bytes": 8123}}
 ```
 
 * `t_mono` — seconds since tracer creation (`time.monotonic`). Never
@@ -44,9 +45,10 @@ Plugin trace — one JSONL line per event:
   never a stable global identifier.
 * `pid` — the plugin's direct child pid (the mux pid in mux deployments).
 * `detail` — bounded classification only: elapsed ms, byte counts, protocol
-  method names, `stopReason`, exit codes, salted hashes, classification
-  enums, explicit `unknown`. Structured values are redacted at the emit
-  boundary; strings are truncated.
+  method names, `stopReason`, exit codes, requested-vs-effective model ids
+  (surface names, never sensitive), salted hashes, classification enums,
+  explicit `unknown`. Structured values are redacted at the emit boundary;
+  strings are truncated.
 
 Mux trace — flat records: `{t_mono, stage, mux_pid, child_pid, lane, reason}`
 for `lane_bound` and `{t_mono, stage, mux_pid, child_pid, exit_code}` for
