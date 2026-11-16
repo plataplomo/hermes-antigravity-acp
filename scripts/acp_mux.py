@@ -294,6 +294,40 @@ def _log(msg: str) -> None:
         pass
 
 
+# Stage tracing (issue #26): opt-in, bounded, privacy-safe. The mux records
+# only what it directly observes: the lane assignment (as the existing lane
+# fingerprint, NEVER the raw account label) and its child's exit. Protocol
+# payloads are never recorded. Pids are the join keys: the plugin-side trace
+# records its direct child (the mux) pid; this file records mux_pid plus
+# child_pid. Same 200 KB single-rotation pattern as _log above (no fcntl, so
+# identical behavior on Windows).
+TRACE_ENABLED = os.environ.get("ACP_MUX_TRACE", "").strip() == "1"
+TRACE_PATH = (
+    os.environ.get("ACP_MUX_TRACE_FILE", "").strip()
+    or os.path.join(os.path.dirname(LOG_PATH) or ".", "acp-mux-trace.jsonl")
+)
+_TRACE_T0 = time.monotonic()
+_trace_lock = threading.Lock()
+
+
+def _trace(stage: str, fields: dict) -> None:
+    if not TRACE_ENABLED:
+        return
+    record = {"t_mono": round(time.monotonic() - _TRACE_T0, 3), "stage": stage}
+    record.update(fields)
+    try:
+        directory = os.path.dirname(TRACE_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with _trace_lock:
+            if os.path.exists(TRACE_PATH) and os.path.getsize(TRACE_PATH) > 200_000:
+                os.replace(TRACE_PATH, TRACE_PATH + ".1")
+            with open(TRACE_PATH, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except OSError:
+        pass
+
+
 def _redact(line: str) -> str:
     line = re.sub(
         r"(access_token|refresh_token|id_token|code_verifier|client_secret)(=|:)\s*\S+",
@@ -2319,6 +2353,15 @@ def main() -> int:
         bound_home = home
         bound_label = label
         _log(f"bound account {label} ({reason}) pid={upstream.pid}")
+        _trace(
+            "lane_bound",
+            {
+                "mux_pid": os.getpid(),
+                "child_pid": upstream.pid,
+                "lane": _lane_fingerprint(home, label),
+                "reason": reason,
+            },
+        )
         out_thread = threading.Thread(target=pump_upstream_out, daemon=True)
         err_thread = threading.Thread(target=pump_upstream_err, daemon=True)
         pump_threads.extend((out_thread, err_thread))
@@ -2479,6 +2522,14 @@ def main() -> int:
                         upstream.wait(timeout=5)
             for thread in pump_threads:
                 thread.join(timeout=1)
+            _trace(
+                "process_exit",
+                {
+                    "mux_pid": os.getpid(),
+                    "child_pid": upstream.pid,
+                    "exit_code": upstream.returncode,
+                },
+            )
     return 0
 
 
