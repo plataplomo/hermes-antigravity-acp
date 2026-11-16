@@ -61,6 +61,46 @@ def test_audit_to_host_filters_every_untrusted_field(tmp_path):
     assert safe_diagnostic(['uname', 'unapproved_executable', '/private/secret']) is None
 
 
+def test_systemctl_environment_delta_identifies_each_reviewed_change_without_values(tmp_path):
+    root = tmp_path.resolve()
+    root.joinpath('runtime').mkdir()
+    fixed = {'PATH': '/usr/bin:/bin', 'XDG_RUNTIME_DIR': str(root / 'runtime')}
+
+    def classify(child, baseline):
+        tokens = set()
+        reason = policy.systemctl_status_reason('systemctl', ['systemctl', 'is-system-running'], root,
+                                                child, root, True, baseline=baseline, diagnostics=tokens)
+        return reason, tokens
+
+    seen = set()
+    for key, identifier in policy.SYSTEMCTL_ENV_IDS.items():
+        base = {**fixed, key: 'before-secret'}
+        for child, change in (({**fixed, key: 'after-secret'}, 'add'),
+                              ({**base, key: 'after-secret'}, 'change'),
+                              ({k: v for k, v in base.items() if k != key}, 'delete')):
+            # The runtime key is already in the fixture; remove it for the add case.
+            baseline = {k: v for k, v in fixed.items() if k != key} if change == 'add' else base
+            reason, tokens = classify(child, baseline)
+            expected = f'env_{identifier}_{change}'
+            assert reason in {'env', 'env_core_markers'}
+            assert tokens == {expected} and expected not in seen
+            assert safe_diagnostic((expected, 'unapproved_executable', 'cli_gateway_systemd_operational'))
+            assert key not in expected and 'secret' not in expected
+            seen.add(expected)
+
+    baseline = {**fixed, 'HERMES_HOME': 'old', 'HERMES_REDACT_SECRETS': 'old'}
+    child = {**fixed, 'HERMES_HOME': 'new', 'PYTHONUTF8': '1', 'PRIVATE_SENSITIVE_NAME': 'secret',
+             'LD_PRELOAD': 'dangerous'}
+    reason, tokens = classify(child, baseline)
+    assert reason == 'env'
+    assert tokens == {'env_j_change', 'env_k_delete', 'env_c_add', 'env_unknown'}
+    assert 'PRIVATE_SENSITIVE_NAME' not in repr(tokens) and 'dangerous' not in repr(tokens)
+    for key in ('LD_PRELOAD', 'LD_LIBRARY_PATH', 'DBUS_SESSION_BUS_ADDRESS', 'SYSTEMD_BUS_ADDRESS'):
+        reason, tokens = classify({**fixed, key: 'dangerous'}, fixed)
+        assert reason == 'env' and tokens == {'env_unknown'}
+    assert not safe_diagnostic(('env_secret_add', 'unapproved_executable', 'cli_gateway_systemd_operational'))
+
+
 @pytest.mark.parametrize('command', [
     ['systemctl', 'is-system-running'], ['systemctl', '--user', 'is-system-running'],
 ])
