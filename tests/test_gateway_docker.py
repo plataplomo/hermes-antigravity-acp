@@ -20,6 +20,7 @@ class DockerBoundaryTests(unittest.TestCase):
             "PortBindings": {}, "CapAdd": None, "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
             "Devices": [], "DeviceRequests": []},
             "Mounts": [{"Destination": "/source", "Source": "/source", "RW": False},
+                       {"Destination": docker.MASK_DESTINATION, "Source": str(docker.MASK_SOURCE), "RW": False},
                        {"Destination": "/gw", "Source": "/private/work", "RW": True},
                        {"Destination": docker.POLICY, "Source": "/private/policy", "RW": False}]}
 
@@ -103,6 +104,90 @@ class DockerBoundaryTests(unittest.TestCase):
             else:
                 facts["Mounts"].pop()
             self.assertFalse(self.verify(facts))
+
+    def test_mask_is_required_exact_readonly_mount(self):
+        expected = f'type=bind,src={docker.MASK_SOURCE},dst={docker.MASK_DESTINATION},readonly'
+        options = docker.docker_options(1001, 1001, [Path('/source')], Path('/private/work'), Path('/private/policy'))
+        self.assertIn(expected, options)
+        for change in ('missing', 'writable', 'foreign', 'duplicate'):
+            facts = self.facts()
+            if change == 'missing':
+                facts['Mounts'].pop(1)
+            elif change == 'writable':
+                facts['Mounts'][1]['RW'] = True
+            elif change == 'foreign':
+                facts['Mounts'][1]['Source'] = '/attacker'
+            else:
+                facts['Mounts'].append(dict(facts['Mounts'][1]))
+            self.assertFalse(self.verify(facts), change)
+
+    def test_mask_inputs_require_root_owned_regular_nonexecutable_file(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        import stat
+        source = MagicMock()
+        source.resolve.return_value = source
+        source.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_nlink=1)
+        target = MagicMock()
+        target.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+        with patch.object(docker, 'MASK_SOURCE', source), patch.object(docker, 'Path', return_value=target):
+            self.assertTrue(docker.mask_inputs_verified())
+            for mode, uid in ((stat.S_IFREG | 0o755, 0), (stat.S_IFREG | 0o666, 0),
+                              (stat.S_IFLNK | 0o644, 0), (stat.S_IFREG | 0o644, 1001)):
+                source.lstat.return_value = SimpleNamespace(st_mode=mode, st_uid=uid, st_nlink=1)
+                self.assertFalse(docker.mask_inputs_verified())
+            source.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_nlink=1)
+            target.lstat.return_value = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0)
+            self.assertFalse(docker.mask_inputs_verified())
+
+    def test_container_mask_identity_permissions_and_exec_denial(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        import stat
+        source = MagicMock()
+        source.stat.return_value = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_nlink=1,
+                                                   st_dev=7, st_ino=19)
+        matched = SimpleNamespace(st_dev=7, st_ino=19)
+        with patch.object(docker, 'MASK_SOURCE', source), patch.object(docker.os, 'geteuid', return_value=1001), \
+             patch.object(docker.os, 'stat', return_value=matched) as actual, \
+             patch.object(docker.os, 'access', return_value=False), \
+             patch.object(docker, '_open_denied', return_value=True), \
+             patch.object(docker.subprocess, 'run', side_effect=PermissionError) as run:
+            self.assertTrue(docker.systemctl_mask_verified())
+            self.assertEqual(run.call_count, 3)
+            actual.return_value = SimpleNamespace(st_dev=7, st_ino=20)
+            self.assertFalse(docker.systemctl_mask_verified())
+            actual.return_value = matched
+            source.stat.return_value.st_nlink = 2
+            self.assertFalse(docker.systemctl_mask_verified())
+            source.stat.return_value.st_nlink = 1
+            source.stat.return_value.st_uid = 1001
+            self.assertFalse(docker.systemctl_mask_verified())
+            source.stat.return_value.st_uid = 0
+            source.stat.return_value.st_mode = stat.S_IFREG | 0o664
+            self.assertFalse(docker.systemctl_mask_verified())
+            source.stat.return_value.st_mode = stat.S_IFREG | 0o644
+            run.side_effect = None
+            self.assertFalse(docker.systemctl_mask_verified())
+
+    def test_service_checks_fail_closed_on_binary_or_bus(self):
+        with patch.dict('os.environ', {'PATH': '/usr/bin:/bin'}, clear=True), patch.object(
+            docker.shutil, 'which', return_value=None) as which, patch.object(
+            docker.os.path, 'lexists', return_value=False) as exists, patch.object(
+            Path, 'read_text', return_value='python\n') as proc:
+            self.assertEqual((True, True), docker.system_services_unavailable())
+            self.assertEqual(which.call_count, 2)
+            which.side_effect = [None, '/usr/sbin/systemctl']
+            self.assertEqual((False, True), docker.system_services_unavailable())
+            which.side_effect = None
+            exists.side_effect = lambda path: str(path) == '/run/dbus/system_bus_socket'
+            self.assertEqual((True, False), docker.system_services_unavailable())
+            exists.side_effect = None
+            proc.return_value = 'systemd\n'
+            self.assertEqual((True, False), docker.system_services_unavailable())
+            proc.return_value = 'python\n'
+            with patch.dict('os.environ', {'DBUS_SESSION_BUS_ADDRESS': 'unsafe'}):
+                self.assertEqual((True, False), docker.system_services_unavailable())
 
     def test_no_boolean_opt_in_can_manufacture_namespace_proof(self):
         with patch.dict("os.environ", {"PHASE_C_DOCKER_POLICY": "true"}, clear=True):

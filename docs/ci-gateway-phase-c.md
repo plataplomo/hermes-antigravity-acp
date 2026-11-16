@@ -158,6 +158,22 @@ container loopback bind works. The host separately inspects exact Docker setting
 mount set and the owned live container PID namespace before releasing execution.
 Only compared namespace hashes, fixed statuses and counts enter the receipt.
 
+The host's `/usr/bin` remains a read-only binary input. The single `systemctl`
+entry is covered by a separate read-only bind of the runner's verified non-executable
+`/usr/lib/os-release` data file, not an executable replacement. Exact source,
+destination, read-only status, non-root execution and the rest of the mount set
+are verified. The container checks the source inode has one hard link, belongs to
+root and has no executable or group/other write bits; the masked paths must name
+that inode. With zero effective capabilities, a non-owner cannot chmod it, even if
+a symlink reaches the inode from a writable directory. Kernel checks require write
+opens and direct execution via `/usr/bin`, `/bin`, and `/sbin` to be denied.
+Before Core runs, the verified container must report no `systemctl`
+from either the fixture PATH or Core's documented system-directory extension,
+no systemd PID 1, and no system/user D-Bus or systemd private socket. Unexpected
+systemctl launches remain sticky audit refusals. This intentionally excludes
+systemd service management and systemctl integration from this Gateway E2E; it
+still tests the unmodified Core's ordinary no-systemd Gateway/Provider path.
+
 The original Gateway driver runs directly after the exercised boundary passes.
 Full pytest remains in Fast and the purpose-specific official Core strict lanes,
 not as a duplicate in-container prerequisite. This intentionally drops the

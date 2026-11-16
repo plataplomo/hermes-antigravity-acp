@@ -19,7 +19,7 @@ import traceback
 from gateway_docker import namespace_verified
 from gateway_process_policy import (BASELINE_ENV, PRUNE_BODY, git_probe_context_verdict,
                                     mismatch_diagnostic, readonly_git_verdict, scratch_command_verdict,
-                                    shutdown_command_verified, systemctl_status_reason)
+                                    shutdown_command_verified)
 from provider_origin import ProviderOrigin
 
 
@@ -226,15 +226,11 @@ def main() -> None:
             if not isinstance(command, (list, tuple)) or not command:
                 reject_launch("unapproved_subprocess")
             name = Path(os.fsdecode(command[0])).name
-            systemctl_diagnostics: set[str] = set()
-            systemctl_reason = (systemctl_status_reason(args[0], command, args[2], args[3], root, confined,
-                                                        diagnostics=systemctl_diagnostics)
-                                if name == "systemctl" else "")
-            systemctl_status = name == "systemctl" and not systemctl_reason
+            # systemctl is never admitted; a verified read-only mask makes it
+            # absent from Core's lookup before this envelope starts.
             if str(args[0]) != str(command[0]) or str(command[0]) != sys.executable and name != "git":
-                if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"} and not systemctl_status:
-                    reject_launch("subprocess_executable_mismatch", (args[0], command, systemctl_reason,
-                                                                     systemctl_diagnostics))
+                if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"}:
+                    reject_launch("subprocess_executable_mismatch", (args[0], command, "", set()))
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
             # argv shape alone cannot make a git child read-only: the binary PATH resolves,
             # the repository the launch cwd selects, and the configuration the child inherits
@@ -254,7 +250,7 @@ def main() -> None:
                     reject_launch("shutdown_diagnostic_not_verified")
                 ledger.note_verified_launch("shutdown", command)
                 housekeeping = True
-            if not (is_fixture or is_readonly_git or housekeeping or systemctl_status):
+            if not (is_fixture or is_readonly_git or housekeeping):
                 reject_launch("unapproved_subprocess")
         elif event in {"os.kill", "os.killpg"}:
             pid, signum = args
