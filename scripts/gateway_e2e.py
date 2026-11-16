@@ -217,7 +217,8 @@ class GatewayFailure(RuntimeError):
 
 
 class Run:
-    def __init__(self, core: Path, repo: Path, root: Path, candidate: str, timeout: float):
+    def __init__(self, core: Path, repo: Path, root: Path, candidate: str, timeout: float, *, inject_fault: bool = False):
+        self.inject_fault = inject_fault
         self.source_core, self.core, self.repo, self.root = core, core, repo, root
         self.timeout = timeout
         self.profile = root / "hermes" / "profiles" / "phasec"
@@ -453,6 +454,21 @@ class Run:
             self.current = "initialize"
             self.need(self.event_count("initialize") > 0, "initialize_not_executed")
             self.pass_stage("initialize", "synthetic_credential_free_acp_initialize_executed")
+            if self.inject_fault:
+                self.current = "injected_fault"
+                held_before = self.event_count("prompt_held")
+                self.control("hold")
+                admitted = self.http("POST", "/p/phasec/v1/runs", {"input": "synthetic-fault-request"})
+                self.need(isinstance(admitted.get("run_id"), str) and bool(admitted["run_id"]), "fault_run_not_admitted")
+                self.wait(lambda: self.event_count("prompt_held") > held_before, "fault_prompt_not_held")
+                events = self.events()
+                held = {event["pid"] for event in events if event.get("event") == "prompt_held"}
+                owned = [event for event in events if event.get("event") == "server_started" and event["pid"] in held]
+                self.need(bool(owned) and all(_live(event["pid"], event["started"])
+                          and _live(event["grandchild_pid"], event["grandchild_started"]) for event in owned),
+                          "fault_held_tree_not_live")
+                self.record["fault_observation"] = {"scenario": "prompt_held_driver_error", "held_tree_live": True}
+                raise GatewayFailure("injected_fault_while_prompt_held")
             self.current = "ownership_conflict"
             lock = self.profile / "gateway.lock"
             lock_before = (lock.stat().st_ino, lock.read_bytes())
@@ -517,16 +533,23 @@ class Run:
     def cleanup(self) -> None:
         forced = False
         forced_reasons: set[str] = set()
-        for role, process in (("contender", self.contender), ("owner", self.process)):
+        owner_exit_seconds: float | None = None
+        # Core's documented busy-shutdown leash is drain(0)+watchdog grace(60s); a gateway
+        # interrupted while a run is active may legitimately use it. The grace must exceed
+        # that contract or the harness SIGKILLs a gateway that was exiting on schedule.
+        for role, process, grace in (("contender", self.contender, 20), ("owner", self.process, 75)):
             if process is not None and process.poll() is None:
+                signal_started = time.monotonic()
                 process.send_signal(signal.SIGINT)
                 try:
-                    process.wait(timeout=20)
+                    process.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
                     forced = True
                     forced_reasons.add("contender_sigint_timeout" if role == "contender" else "owner_sigint_timeout")
                     os.killpg(process.pid, signal.SIGKILL)  # only our Popen session, never a host scan
                     process.wait(timeout=5)
+                if role == "owner":
+                    owner_exit_seconds = round(time.monotonic() - signal_started, 3)
         fixture_wait_started = time.monotonic()
         fixture_deadline = fixture_wait_started + 5
         while True:
@@ -596,6 +619,7 @@ class Run:
                       "zero" if returncode == 0 else "signal" if returncode < 0 else "nonzero")
         self.record["cleanup_diagnostics"] = {
             "forced_reasons": sorted(forced_reasons), "owner_exit": exit_class,
+            "owner_exit_seconds": owner_exit_seconds,
             "fixture_exit": {"status": "not_observed" if not fixture_ids else "timeout" if fixture_unmet else "complete",
                              "elapsed_seconds": fixture_elapsed, "unmet": fixture_unmet}}
         if self.process is not None:
@@ -616,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--keep-diagnostics", action="store_true", help="local development only; never upload raw logs")
+    parser.add_argument("--inject-held-fault", action="store_true", help="inject one bounded failure inside the verified container")
     args = parser.parse_args(argv)
     # Hosted diagnosis (issue #28, run 43611722789): Core's api_server adapter degrades to
     # "no adapter available" when aiohttp is absent, so the Gateway boots but never binds and
@@ -638,7 +663,7 @@ def main(argv: list[str] | None = None) -> int:
     run = None
     try:
         root = Path(directory).resolve()
-        run = Run(core, repo, root, args.candidate_sha, args.timeout)
+        run = Run(core, repo, root, args.candidate_sha, args.timeout, inject_fault=args.inject_held_fault)
         result = run.execute()
         for diagnostic in sorted(refusal_diagnostics(root)):
             print(DIAGNOSTIC_MARKER, *diagnostic, flush=True)

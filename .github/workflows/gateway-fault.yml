@@ -1,0 +1,75 @@
+name: Gateway fault cleanup diagnostic
+
+# Independent of the required CI gate: one credential-free, hosted-only
+# negative case when the Gateway harness changes. Never a release publisher.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/gateway-fault.yml
+      - scripts/gateway_docker.py
+      - scripts/gateway_e2e.py
+      - scripts/gateway_fake_acp.py
+      - scripts/gateway_fault_check.py
+      - tests/test_gateway_fault.py
+
+permissions:
+  contents: read
+
+jobs:
+  fault-cleanup:
+    name: Gateway injected failure and cleanup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify PR head and execution identities
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXECUTION_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$EXECUTION_SHA"
+          test "$(git rev-parse HEAD^2)" = "$PR_HEAD"
+          printf 'execution_sha=%s\npr_head_sha=%s\n' "$EXECUTION_SHA" "$PR_HEAD"
+      - name: Load stable Hermes source identity
+        id: baseline
+        run: |
+          python3 -c 'from scripts.gateway_attestation import stable_baseline; import os; p=stable_baseline(); open(os.environ["GITHUB_OUTPUT"],"a").write("commit="+p["commit"]+"\n")'
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ steps.baseline.outputs.commit }}
+          path: upstream-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install pinned uv and stable Core dependencies
+        run: |
+          set -eu
+          python -m pip install --disable-pip-version-check uv==0.13.5
+          cd upstream-hermes
+          uv sync --frozen --python 3.14 --group dev --extra messaging
+      - name: Exclude only generated checkout and sanitized receipt
+        run: printf '%s\n' '/upstream-hermes/' '/gateway-fault-verification.json' >> .git/info/exclude
+      - name: Verify injected failure and owned cleanup
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          CORE_SHA: ${{ steps.baseline.outputs.commit }}
+        run: >-
+          upstream-hermes/.venv/bin/python scripts/gateway_fault_check.py
+          --hermes-root upstream-hermes --candidate-sha "$CANDIDATE_SHA"
+          --core-sha "$CORE_SHA" --output gateway-fault-verification.json
+      - name: Preserve sanitized fault receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-fault-${{ github.run_id }}-${{ github.run_attempt }}
+          path: gateway-fault-verification.json
+          if-no-files-found: error
+          retention-days: 30
