@@ -786,11 +786,14 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+      - name: Load mandatory stable Hermes baseline
+        id: stable-baseline
+        run: |
+          python3 -c 'from scripts.gateway_attestation import stable_baseline; import os; p=stable_baseline(); f=open(os.environ["GITHUB_OUTPUT"],"a"); [f.write(f"{k}={v}\n") for k,v in p.items()]; f.close()'
       - uses: actions/checkout@v4
         with:
           repository: NousResearch/hermes-agent
-          # Diagnostic-only pin. The guard below prevents latest-Core PASS.
-          ref: 5e9c0cd31e783605ada6bd6f01da505bf9b6b10b
+          ref: ${{ steps.stable-baseline.outputs.commit }}
           path: upstream-hermes
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -801,22 +804,30 @@ jobs:
       - name: Record exact official Hermes target
         id: hermes-target
         shell: bash
+        env:
+          STABLE_TAG: ${{ steps.stable-baseline.outputs.tag }}
+          STABLE_COMMIT: ${{ steps.stable-baseline.outputs.commit }}
+          STABLE_IMAGE: ${{ steps.stable-baseline.outputs.docker_image }}
         run: |
           set -eu
           commit=$(git -C upstream-hermes rev-parse HEAD)
-          test "$commit" = 5e9c0cd31e783605ada6bd6f01da505bf9b6b10b
+          test "$commit" = "$STABLE_COMMIT"
+          git -C upstream-hermes fetch --no-tags --depth=1 origin "refs/tags/$STABLE_TAG:refs/tags/$STABLE_TAG"
+          python3 -c 'import json,os,subprocess,sys; t=os.environ["STABLE_TAG"]; raw=subprocess.check_output(["git","-C","upstream-hermes","cat-file","-p","refs/tags/"+t],text=True); m=json.loads(raw.split("\n\n",1)[1]); sys.exit(not (m["version"]==t[1:] and m["commit"]==os.environ["STABLE_COMMIT"] and m["dockerManifestDigest"]==os.environ["STABLE_IMAGE"].split("@",1)[1]))'
+          test "$(git -C upstream-hermes rev-parse "refs/tags/$STABLE_TAG^{}")" = "$STABLE_COMMIT"
           tree=$(git -C upstream-hermes rev-parse 'HEAD^{tree}')
           printf 'commit=%s\ntree=%s\n' "$commit" "$tree" >> "$GITHUB_OUTPUT"
           printf '%s\n' \
-            '### Upstream Hermes compatibility target' \
+            '### Stable Hermes compatibility target' \
             '- Repository: `NousResearch/hermes-agent`' \
-            '- Requested ref: `5e9c0cd31e783605ada6bd6f01da505bf9b6b10b` (diagnostic only; not latest)' >> "$GITHUB_STEP_SUMMARY"
+            "- Release: \`$STABLE_TAG\`" \
+            "- Official Docker image digest (metadata only; not executed): \`$STABLE_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' \
             "- Tested commit: \`$commit\`" \
             "- Tested tree: \`$tree\`" \
             "- Python: $(python --version 2>&1)" \
             "- uv: $(uv --version)" >> "$GITHUB_STEP_SUMMARY"
-          printf 'NousResearch/hermes-agent diagnostic-pin %s\nTree %s\n' "$commit" "$tree" > upstream-hermes-provenance.txt
+          printf 'NousResearch/hermes-agent stable %s\nTree %s\nDocker image metadata %s\n' "$commit" "$tree" "$STABLE_IMAGE" > upstream-hermes-provenance.txt
       - name: Install official Hermes from its committed lock
         working-directory: upstream-hermes
         # The messaging extra provides the aiohttp that Core's api_server adapter requires
@@ -838,7 +849,7 @@ jobs:
         run: >-
           .venv/bin/python -c
           'import providers; from providers import register_provider; from providers.base import ProviderProfile; assert callable(register_provider); assert callable(ProviderProfile.create_client); print(providers.__file__)'
-      - name: Official catalog admission validation (diagnostic pinned Core)
+      - name: Official catalog admission validation (stable Core)
         # Same checks the official plugin-catalog CI runs at admission:
         # manifest, requires_hermes, capability probe, security scan,
         # no core override, private imports. Non-zero exit blocks.
@@ -865,7 +876,6 @@ jobs:
           printf '%s\n' '/upstream-hermes/' '/upstream-hermes-provenance.txt' '/upstream-hermes-lock.sha256' '/upstream-hermes-dependencies.txt' '/gateway-e2e-verification.json' >> .git/info/exclude
       - name: Disposable real-Core Gateway E2E
         id: gateway
-        if: needs.change-scope.outputs.os_lanes == 'true'
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
         run: >-
@@ -875,7 +885,7 @@ jobs:
           --output gateway-e2e-verification.json
       - name: Validate executed Gateway receipt against candidate and Core
         id: gateway-attest
-        if: success() && needs.change-scope.outputs.os_lanes == 'true'
+        if: success()
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
           CORE_SHA: ${{ steps.hermes-target.outputs.commit }}
@@ -883,13 +893,18 @@ jobs:
           python scripts/gateway_attestation.py
           --record gateway-e2e-verification.json
           --candidate "$CANDIDATE_SHA" --core "$CORE_SHA"
-      - name: Diagnostic pin cannot satisfy latest-Core compatibility
+      - name: Enforce stable Core identity without claiming latest compatibility
         if: always()
+        env:
+          EXPECTED_CORE: ${{ steps.stable-baseline.outputs.commit }}
+          TESTED_CORE: ${{ steps.hermes-target.outputs.commit }}
         run: |
-          printf '%s\n' 'Diagnostic Core pin is not latest-Core evidence.'
-          exit 1
+          set -eu
+          test -n "$EXPECTED_CORE"
+          test "$TESTED_CORE" = "$EXPECTED_CORE"
+          printf '%s\n' 'Stable Core evidence is not latest-main compatibility evidence.'
       - name: Preserve sanitized Gateway evidence only
-        if: always() && needs.change-scope.outputs.os_lanes == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gateway-e2e-${{ github.run_id }}-${{ github.run_attempt }}
@@ -993,6 +1008,65 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha || github.sha }}
         run: python scripts/candidate_identity.py --attest-checkout
+
+  latest-main-compat:
+    name: Advisory upstream main compatibility (non-blocking)
+    # This diagnostic is intentionally outside CI gate and Release gate needs.
+    # Its own failure remains visible; it never represents stable evidence.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: upstream-hermes-main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check uv==0.13.5
+      - name: Install latest Core from its committed lock
+        working-directory: upstream-hermes-main
+        run: uv sync --frozen --python 3.14 --group dev --extra messaging
+      - name: Record latest main identity
+        id: latest-target
+        run: |
+          set -eu
+          commit=$(git -C upstream-hermes-main rev-parse HEAD)
+          tree=$(git -C upstream-hermes-main rev-parse 'HEAD^{tree}')
+          printf 'commit=%s\ntree=%s\n' "$commit" "$tree" >> "$GITHUB_OUTPUT"
+          printf '### Advisory latest-main compatibility\n\n- Tested commit: `%s`\n- Tested tree: `%s`\n' "$commit" "$tree" >> "$GITHUB_STEP_SUMMARY"
+      - name: Official catalog admission validation (latest main)
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-main-validate-home
+        run: upstream-hermes-main/.venv/bin/hermes plugins validate hermes-plugin/antigravity-acp --install-deps
+      - name: Exercise strict provider seam (latest main)
+        env:
+          HERMES_STRICT_SEAM_TEST: "1"
+          HERMES_TESTED_COMMIT: ${{ steps.latest-target.outputs.commit }}
+          HERMES_TESTED_TREE: ${{ steps.latest-target.outputs.tree }}
+          UPSTREAM_HERMES_DIR: ${{ github.workspace }}/upstream-hermes-main
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+        run: >-
+          upstream-hermes-main/.venv/bin/python -m pytest -q
+          tests/test_vanilla_hermes_seam.py
+          tests/test_upstream_hermes_runtime_contracts.py
+          tests/test_upstream_delegate_affinity_e2e.py
+      - name: Confirm latest Core source remained unmodified
+        if: always()
+        run: |
+          git -C upstream-hermes-main diff --exit-code
+          git -C upstream-hermes-main diff --cached --exit-code
+          test -z "$(git -C upstream-hermes-main status --porcelain --untracked-files=no)"
 
   ci-gate:
     name: CI gate

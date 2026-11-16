@@ -16,8 +16,8 @@ SHA = "a" * 40
 
 
 def good_outputs():
-    return {"attested_sha": SHA, "gateway_core": "b" * 40, "gateway_result": "success", "gateway_record": json.dumps({
-        "schema_version": 2, "candidate_sha": SHA, "hermes_commit": "b" * 40, "status": "PASS", "boundary_refusal_reasons": [],
+    return {"attested_sha": SHA, "gateway_core": "3b421578588243f920886e6fe79a6faa87ea026e", "gateway_result": "success", "gateway_record": json.dumps({
+        "schema_version": 2, "candidate_sha": SHA, "hermes_commit": "3b421578588243f920886e6fe79a6faa87ea026e", "status": "PASS", "boundary_refusal_reasons": [],
         "owned_child_count": 2, "live_owned_children_after_exit": 0, "candidate_source_dirty": False,
                 "provider_origin": {"status": "PASS", "candidate_sha": SHA, "tree_sha256": "3" * 64,
                                     "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
@@ -37,19 +37,50 @@ class GatewayGateContractTests(unittest.TestCase):
             "provider_factory", "initialize", "request_response", "permission_denial", "cancellation",
             "ownership_conflict", "owner_survives", "shutdown", "child_cleanup", "source_unchanged"})
 
-    def test_only_existing_latest_linux_lane_executes_gateway(self):
+    def test_only_stable_linux_lane_executes_gateway(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual(ci.count("python scripts/gateway_docker.py"), 1)
         block = ci.split("  upstream-hermes-compat:\n")[1].split("  catalog-floor-gate:\n")[0]
         for required in ("needs: [change-scope]", "id: gateway", "steps.gateway.outcome",
                          "steps.gateway-attest.outputs.record", "scripts/gateway_attestation.py",
                          "--core \"$CORE_SHA\"", "path: gateway-e2e-verification.json",
-                         "if: needs.change-scope.outputs.os_lanes == 'true'"):
+                         "steps.stable-baseline.outputs.commit", "steps.stable-baseline.outputs.docker_image",
+                         "Enforce stable Core identity without claiming latest compatibility"):
             self.assertIn(required, block)
         self.assertNotIn("python scripts/gateway_e2e.py", ci)
         self.assertNotIn("continue-on-error", block)
         self.assertIn("tests/test_upstream_hermes_runtime_contracts.py", block)
         self.assertIn("name: CI gate", ci)
+
+    def test_stable_evidence_required_at_every_scope_and_wrong_core_rejected(self):
+        results: dict = {name: {"result": "success"} for name in (
+            "change-scope", *ci_gate_check.FAST_LANES, *ci_gate_check.OS_LANES, *ci_gate_check.ARM_LANES)}
+        results["upstream-hermes-compat"]["outputs"] = good_outputs()
+        scopes: list[dict[str, object]] = [{"os_lanes": "false", "extended_arm": "false"},
+                                           {"os_lanes": "true", "extended_arm": "true"}]
+        for scope in scopes:
+            self.assertTrue(ci_gate_check.evaluate(scope, results)[0])
+            results["upstream-hermes-compat"]["outputs"] = {"gateway_result": "skipped"}
+            self.assertFalse(ci_gate_check.evaluate(scope, results)[0])
+            wrong = good_outputs()
+            wrong["gateway_core"] = "b" * 40
+            record = json.loads(wrong["gateway_record"])
+            record["hermes_commit"] = "b" * 40
+            wrong["gateway_record"] = json.dumps(record)
+            results["upstream-hermes-compat"]["outputs"] = wrong
+            self.assertFalse(ci_gate_check.evaluate(scope, results)[0])
+            results["upstream-hermes-compat"]["outputs"] = good_outputs()
+
+    def test_latest_main_diagnostic_does_not_enter_required_gates(self):
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        latest = ci.split("  latest-main-compat:\n")[1].split("  ci-gate:\n")[0]
+        self.assertIn("ref: main", latest)
+        self.assertIn("tests/test_upstream_hermes_runtime_contracts.py", latest)
+        self.assertNotIn("continue-on-error", latest)
+        for job in ("ci-gate", "release-gate"):
+            block = ci.split(f"  {job}:\n")[1]
+            needs = next(line for line in block.splitlines() if line.startswith("    needs:"))
+            self.assertNotIn("latest-main-compat", needs)
 
     def test_ci_enclosing_success_cannot_hide_missing_or_skipped_gateway(self):
         results: dict = {name: {"result": "success"} for name in (
@@ -73,6 +104,14 @@ class GatewayGateContractTests(unittest.TestCase):
         self.assertFalse(release_gate_check.evaluate(SHA, identity, results, matrix)[0])
         results["upstream-hermes-compat"]["outputs"].update(good_outputs())
         self.assertTrue(release_gate_check.evaluate(SHA, identity, results, matrix)[0])
+        wrong = good_outputs()
+        wrong["gateway_core"] = "b" * 40
+        record = json.loads(wrong["gateway_record"])
+        record["hermes_commit"] = "b" * 40
+        wrong["gateway_record"] = json.dumps(record)
+        results["upstream-hermes-compat"]["outputs"].update(wrong)
+        self.assertFalse(release_gate_check.evaluate(SHA, identity, results, matrix)[0])
+        results["upstream-hermes-compat"]["outputs"].update(good_outputs())
         record = json.loads(good_outputs()["gateway_record"])
         record["scratch_cleanup"] = {"status": "BLOCKED"}
         results["upstream-hermes-compat"]["outputs"]["gateway_record"] = json.dumps(record)

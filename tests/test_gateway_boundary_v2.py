@@ -121,6 +121,13 @@ def test_both_outer_gates_reject_v2_contamination_and_residue():
     for lane in matrix.lanes:
         results[lane]["outputs"]["stages"] = ",".join(stage for (_, stage), owner in matrix.required_stage_lanes().items() if owner == lane)
     output = GatewayAttestationTests().outputs()
+    stable_core = "3b421578588243f920886e6fe79a6faa87ea026e"
+    output["gateway_core"] = stable_core
+    raw_record = output["gateway_record"]
+    assert isinstance(raw_record, str)
+    stable_record = json.loads(raw_record)
+    stable_record["hermes_commit"] = stable_core
+    output["gateway_record"] = json.dumps(stable_record)
     results["upstream-hermes-compat"]["outputs"].update(output)
     flags = {"os_lanes": "true", "extended_arm": "true"}
     assert ci_gate_check.evaluate(flags, {k: v for k, v in results.items() if k not in {"candidate-identity", "ci-gate"}})[0]
@@ -129,6 +136,7 @@ def test_both_outer_gates_reject_v2_contamination_and_residue():
                        ("checkout_sha", "c" * 40), ("hermes_commit", "c" * 40),
                        ("candidate_source_dirty", True), ("regression", {"status": "PASS"})):
         changed = receipt()
+        changed["hermes_commit"] = stable_core
         changed[key] = value
         results["upstream-hermes-compat"]["outputs"]["gateway_record"] = json.dumps(changed)
         assert not ci_gate_check.evaluate(flags, {k: v for k, v in results.items() if k not in {"candidate-identity", "ci-gate"}})[0]

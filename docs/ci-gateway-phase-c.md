@@ -31,8 +31,9 @@ origin evidence or wrong candidate SHA fails the existing CI/Release validators.
 This instrumentation is for trusted CI code, not a hostile-Python sandbox.
 
 Local loader-shape fixtures are explicitly offline mocks, not real Core runtime
-proof. Real latest/floor compatibility and Gateway acceptance still require their
-unchanged Hosted lanes. No local Gateway/Docker fallback or additional security
+proof. Real stable-v0.23.1/floor compatibility and Gateway acceptance still require
+their unchanged Hosted lanes (latest-`main` is the separate non-blocking
+advisory diagnostic under the 2026-11-16 baseline policy). No local Gateway/Docker fallback or additional security
 grant is introduced by frozen-copy compatibility.
 
 
@@ -46,11 +47,15 @@ release, operating deployment or production service change is authorized.
 ## Evidence classes and existing coverage
 
 Existing CI retains automatically discovered fake-ACP protocol regressions,
-latest and minimum supported strict real-Core provider seams, publisher integrity,
+stable v0.23.1 and minimum supported strict real-Core provider seams (the
+latest-`main` seam is the separate advisory diagnostic since 2026-11-16), publisher integrity,
 and five native platform installation/registration/initialize/removal lanes.
 None of those is a real Gateway boot and request proof by itself.
 
-The new driver reuses the latest-Core Linux x86_64 environment; it does not
+The new driver reuses the required strict-Core Linux x86_64 environment —
+since the 2026-11-16 baseline policy that is the mandatory stable v0.23.1 lane
+(the Gateway receipt is required against the stable baseline; the former
+latest-`main` job is the separate advisory diagnostic); it does not
 start Gateway instances on Windows ARM64 or add five duplicate Gateway lanes.
 It executes the unchanged public `hermes_cli.main` foreground CLI and official
 HTTP `/p/phasec/health/detailed`, `/p/phasec/v1/runs`, run status and run stop APIs.
@@ -106,8 +111,8 @@ observations, not established ACP product defects.
 | Owner | Required evidence | Does not establish |
 |---|---|---|
 | Fast | Entire automatically discovered credential-free suite, Ruff, public-tree audit | Compatibility of that entire suite with the restricted container filesystem/process budget |
-| Latest + floor strict Core | Official unmodified provider API, candidate/home/frozen-byte provenance, credential boundary and delegate affinity | A running Gateway |
-| Docker boundary | Non-root, empty capabilities, no-new-privileges, separate PID/network namespaces, network none, read-only roots and exact mounts, loopback, host-verified ownership | Full-suite PASS inside the container |
+| Stable v0.23.1 + floor strict Core (latest-`main` is the separate non-blocking advisory diagnostic, not compatibility evidence) | Official unmodified provider API, candidate/home/frozen-byte provenance, credential boundary and delegate affinity | A running Gateway |
+| Docker boundary | Non-root, empty capabilities, no-new-privileges, separate PID/network namespaces, network none, read-only roots and exact mounts, loopback, host-verified ownership | Full-suite PASS inside the container; the official Docker Hub image runtime is not independently tested by this source-checkout/scratch-rootfs boundary |
 | Real Gateway in that boundary | All fourteen required stages, original scratch/shutdown checks, source bytes unchanged, PID1-only final inventory | Authenticated Google inference or vendor-side cancellation |
 
 Only after actual kernel controls AND the host ownership handshake pass does the
@@ -178,8 +183,10 @@ The original Gateway driver runs directly after the exercised boundary passes.
 Full pytest remains in Fast and the purpose-specific official Core strict lanes,
 not as a duplicate in-container prerequisite. This intentionally drops the
 whole-suite-in-container guarantee described in the historical v1 contract.
-Native Fast/OS/Extended ARM and latest/floor strict obligations remain required;
-the stable CI/Release aggregators enforce the v2 Docker/Gateway receipt.
+Native Fast/OS/Extended ARM and stable-v0.23.1/floor strict obligations remain
+required (latest-`main` is the non-blocking advisory diagnostic); the stable
+CI/Release aggregators enforce the v2 Docker/Gateway receipt against the stable
+baseline.
 
 The original Core `python -I` scratch child is admitted only after exact executable,
 argv, import-path and canonical owned-target checks **and actual namespace proof**.
@@ -323,16 +330,16 @@ provisioning gap cannot masquerade as a Gateway startup timeout.
 
 ## CI gating policy
 
-The existing `os_lanes` risk decision conservatively also requires Gateway E2E.
-Provider/client/permission/cancel/install changes require it; docs and the two
-exact reviewed neutral tests can omit it; unreviewed paths and ambiguous metadata
-widen to full validation. This adds no classifier flag or new job. Latest/floor
-strict seams continue running regardless of the optional Gateway step.
+Gateway E2E is mandatory on every CI event under the stable v0.23.1 policy.
+The existing risk classifier still decides which native OS and extended ARM lanes
+are required; it no longer controls Gateway execution. The advisory latest-`main`
+strict seam runs independently and does not gate the stable result.
 
-The existing latest-Core job publishes the actual Gateway step outcome and a
+The existing required strict-Core job (the stable v0.23.1 baseline lane since
+2026-11-16) publishes the actual Gateway step outcome and a
 receipt validated against the candidate and the separately resolved Core SHA.
-`CI gate` independently requires that outcome and every mandatory stage when OS
-scope is required; an enclosing job success alone is insufficient. Every exact-SHA
+`CI gate` independently requires that outcome and every mandatory stage at every
+scope; an enclosing job success alone is insufficient. Every exact-SHA
 Release verification requires the Gateway receipt too and includes it in the
 result document alongside, not instead of, the unchanged forty native matrix cells.
 Missing, skipped, failed, cancelled, malformed or wrong-SHA evidence fails closed.
