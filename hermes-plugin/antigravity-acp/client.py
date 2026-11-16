@@ -4204,10 +4204,8 @@ class AntigravityACPClient:
             tool_calls: list[Any] = []
             cleaned_text = ""
             # One request-wide malformed-correction budget (issue #14). The
-            # primary path spends at most _MAX_MALFORMED_TOOL_CALL_CORRECTIONS
-            # of it; whatever remains is what the read-evidence correction
-            # path below may still spend, so nested loops never multiply the
-            # regeneration allowance.
+            # primary path spends at most _MAX_MALFORMED_TOOL_CALL_CORRECTIONS;
+            # all later correction paths share the remaining allowance.
             malformed_budget = [_MAX_MALFORMED_TOOL_CALL_CORRECTIONS]
             tool_calls, cleaned_text, session_result, reasoning, malformed_corrections_used = (
                 self._extract_with_malformed_recovery(
@@ -4230,6 +4228,9 @@ class AntigravityACPClient:
                     "Antigravity ACP correction did not produce a valid Hermes tool call; "
                     "refusing to present an unverified task completion."
                 )
+            remaining_malformed_budget = [
+                _MAX_MALFORMED_TOOL_CALL_CORRECTIONS_TOTAL - malformed_corrections_used
+            ]
     
             # Duplicate no-progress tool-action checking is an
             # agent-interactive guard; llm_backend mode skips it by keeping
@@ -4272,8 +4273,21 @@ class AntigravityACPClient:
                         replay_image_blocks=replay_image_blocks,
                         thinking_level=requested_thinking_level,
                     )
-                    tool_calls, cleaned_text = _extract_advertised_tool_calls(
-                        response_text, correction_tools
+                    tool_calls, cleaned_text, correction_result, reasoning, _used = (
+                        self._extract_with_malformed_recovery(
+                            response_text,
+                            correction_tools,
+                            session_result=correction_result,
+                            budget=remaining_malformed_budget,
+                            model=model,
+                            affinity_key=affinity_key,
+                            full_prompt_text=corrected_prompt,
+                            replay_image_blocks=replay_image_blocks,
+                            thinking_level=requested_thinking_level,
+                            timeout_seconds=timeout_seconds,
+                            started=started,
+                            reasoning=reasoning,
+                        )
                     )
                     if not _repeats_latest_unchanged_call(request_messages, tool_calls):
                         active_tools = correction_tools
@@ -4301,17 +4315,6 @@ class AntigravityACPClient:
                 )
                 and not _pending_read_tool_call(tool_calls)
             ):
-                # Issue #14: the read-evidence path may only spend what the
-                # primary path left of the request-wide malformed budget, and
-                # the same list carries consumption across outer iterations so
-                # the loops never multiply the regeneration allowance.
-                read_evidence_malformed_budget = [
-                    max(
-                        0,
-                        _MAX_MALFORMED_TOOL_CALL_CORRECTIONS_TOTAL
-                        - malformed_corrections_used,
-                    )
-                ]
                 for _read_evidence_attempt in range(_MAX_READ_EVIDENCE_CORRECTIONS):
                     remaining = timeout_seconds - (time.monotonic() - started)
                     if remaining <= 0:
@@ -4343,7 +4346,7 @@ class AntigravityACPClient:
                             response_text,
                             active_tools,
                             session_result=correction_result,
-                            budget=read_evidence_malformed_budget,
+                            budget=remaining_malformed_budget,
                             model=model,
                             affinity_key=affinity_key,
                             full_prompt_text=correction_full_prompt,
@@ -4420,10 +4423,22 @@ class AntigravityACPClient:
                         replay_image_blocks=replay_image_blocks,
                         thinking_level=requested_thinking_level,
                     )
-                    tool_calls, cleaned_text = _extract_advertised_tool_calls(
-                        response_text, active_tools
+                    tool_calls, cleaned_text, session_result, reasoning, _used = (
+                        self._extract_with_malformed_recovery(
+                            response_text,
+                            active_tools,
+                            session_result=correction_result,
+                            budget=remaining_malformed_budget,
+                            model=model,
+                            affinity_key=affinity_key,
+                            full_prompt_text=correction_full_prompt,
+                            replay_image_blocks=replay_image_blocks,
+                            thinking_level=requested_thinking_level,
+                            timeout_seconds=timeout_seconds,
+                            started=started,
+                            reasoning=reasoning,
+                        )
                     )
-                    session_result = correction_result
                     if tool_calls:
                         missing_artifacts = ()
                         break
@@ -4964,9 +4979,8 @@ class AntigravityACPClient:
     ) -> tuple[list[Any], str, dict[str, Any], str, int]:
         """Extract advertised tool calls, correcting malformed envelopes in-session.
 
-        Shared by the primary extraction path and the read-evidence correction
-        path so both consume one bounded malformed-correction budget (``budget``
-        is a single-element remaining-count list). Only recoverable
+        Shared by the primary and correction paths. ``budget`` is a
+        single-element remaining-count list. Only recoverable
         ``MalformedToolCallError`` enters the correction loop; unadvertised
         tools, leaked tool-result protocol data, and every other exception keep
         their existing fail-closed behavior. The invalid call is never

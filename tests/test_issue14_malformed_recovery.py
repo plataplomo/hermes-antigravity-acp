@@ -100,6 +100,148 @@ def _create(client, tools=None):
     )
 
 
+def _duplicate_messages(review=False):
+    return [
+        _REVIEW_MESSAGE if review else {"role": "user", "content": "inspect"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "previous", "type": "function", "function": {
+                "name": "read_state", "arguments": json.dumps({"path": "x"}),
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "previous", "name": "read_state",
+         "content": '{"unchanged":true}'},
+    ]
+
+
+def _script_corrections(monkeypatch, client, responses):
+    turns = []
+
+    def run(prompt, **kwargs):
+        turns.append((prompt, kwargs.copy()))
+        session = kwargs["resume_session_id"] or f"session-{len(turns)}"
+        kwargs["session_result"].update(session_id=session, native_activity={"native_tool_calls": []})
+        return responses[len(turns) - 1], ""
+
+    monkeypatch.setattr(client, "_run_prompt", run)
+    return turns
+
+
+def test_duplicate_correction_recovers_on_new_session_without_blocked_tool(monkeypatch):
+    _, client, client_module = _load(monkeypatch)
+    extract = client_module._extract_advertised_tool_calls
+    advertised = []
+
+    def record_extract(text, tools):
+        advertised.append([tool["function"]["name"] for tool in tools])
+        return extract(text, tools)
+
+    monkeypatch.setattr(client_module, "_extract_advertised_tool_calls", record_extract)
+    turns = _script_corrections(monkeypatch, client, [
+        _valid_call("read_state", path="x"),
+        _valid_call("read_file", call_id="discard") + _malformed_call(),
+        _valid_call(call_id="accepted"),
+    ])
+    result = client.chat.completions.create(
+        model="gemini-test", messages=_duplicate_messages(),
+        tools=[_tool_schema("read_state"), _tool_schema("read_file")],
+    )
+    assert [call.id for call in result.choices[0].message.tool_calls] == ["accepted"]
+    assert turns[1][1]["resume_session_id"] == ""
+    assert turns[2][1]["resume_session_id"] == "session-2"
+    assert turns[2][1]["strict_same_session"] is True
+    assert advertised == [["read_state", "read_file"], ["read_file"], ["read_file"]]
+
+
+def test_scratch_correction_recovers_in_producing_session(monkeypatch, tmp_path):
+    _, client, _ = _load(monkeypatch)
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    missing = home / "cache" / "scratch" / "missing.json"
+    turns = _script_corrections(monkeypatch, client, [
+        f"Evidence file saved at {missing}.", _malformed_call(), _valid_call(),
+    ])
+    result = client.chat.completions.create(
+        model="gemini-test", messages=[{"role": "user", "content": "produce evidence"}],
+        tools=[_tool_schema("read_file")],
+    )
+    assert result.choices[0].message.tool_calls[0].id == "call-good"
+    assert turns[2][1]["resume_session_id"] == "session-1"
+    assert turns[2][1]["strict_same_session"] is True
+    assert not missing.exists()
+
+
+def test_scratch_malformed_then_repeated_missing_claim_still_fails(monkeypatch, tmp_path):
+    _, client, _ = _load(monkeypatch)
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    missing = home / "cache" / "scratch" / "missing.json"
+    claim = f"Evidence file saved at {missing}."
+    turns = _script_corrections(monkeypatch, client, [claim, _malformed_call(), claim])
+    with pytest.raises(RuntimeError, match="still claims scratch artifacts"):
+        client.chat.completions.create(
+            model="gemini-test", messages=[{"role": "user", "content": "produce evidence"}],
+            tools=[_tool_schema("read_file")],
+        )
+    assert len(turns) == 3
+    assert not missing.exists()
+
+
+def test_duplicate_and_read_evidence_share_malformed_budget(monkeypatch):
+    _, client, client_module = _load(monkeypatch)
+    monkeypatch.setattr(client_module, "_completed_hermes_read_evidence", lambda messages: False)
+    turns = _script_corrections(monkeypatch, client, [
+        _malformed_call("read_state"),
+        _valid_call("read_state", path="x"),
+        _malformed_call("terminal"),
+        _valid_call("terminal"),
+        _malformed_call(),
+    ])
+    with pytest.raises(RuntimeError, match="request-wide malformed budget is exhausted"):
+        client.chat.completions.create(
+            model="gemini-test", messages=_duplicate_messages(review=True),
+            tools=[_tool_schema("read_state"), _tool_schema("terminal"), _tool_schema("read_file")],
+        )
+    assert len(turns) == 5
+    assert sum(bool(kwargs.get("strict_same_session")) for _, kwargs in turns) == 2
+
+
+def test_nested_duplicate_recoveries_exhaust_budget_before_scratch(monkeypatch, tmp_path):
+    _, client, _ = _load(monkeypatch)
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    missing = home / "cache" / "scratch" / "missing.json"
+    turns = _script_corrections(monkeypatch, client, [
+        _valid_call("read_state", path="x"),
+        _malformed_call(),
+        _malformed_call(),
+        f"Evidence file saved at {missing}.",
+        _malformed_call(),
+    ])
+    with pytest.raises(RuntimeError, match="request-wide malformed budget is exhausted"):
+        client.chat.completions.create(
+            model="gemini-test", messages=_duplicate_messages(),
+            tools=[_tool_schema("read_state"), _tool_schema("read_file")],
+        )
+    assert len(turns) == 5
+    assert sum(bool(kwargs.get("strict_same_session")) for _, kwargs in turns) == 2
+    assert not missing.exists()
+
+
+def test_duplicate_regeneration_rejects_blocked_tool(monkeypatch):
+    _, client, _ = _load(monkeypatch)
+    turns = _script_corrections(monkeypatch, client, [
+        _valid_call("read_state", path="x"),
+        _malformed_call(),
+        _valid_call("read_state", path="x"),
+    ])
+    with pytest.raises(RuntimeError, match="unadvertised"):
+        client.chat.completions.create(
+            model="gemini-test", messages=_duplicate_messages(),
+            tools=[_tool_schema("read_state"), _tool_schema("read_file")],
+        )
+    assert len(turns) == 3
+
+
 def test_malformed_in_read_evidence_correction_recovers_in_same_session(monkeypatch) -> None:
     """One malformed read-evidence turn recovers with one same-session regeneration."""
     _, client, _ = _load(monkeypatch)
@@ -568,7 +710,7 @@ for line in sys.stdin:
         row["resumed_session_id"] = str(params.get("sessionId") or "")
         log(row)
         result = dict(MODEL_CONFIG)
-        if MODE == "wrong_id":
+        if MODE in ("wrong_id", "duplicate_wrong_id"):
             # An explicitly different id is a protocol anomaly strict mode must
             # refuse; a legal omission is the else branch (no sessionId key).
             result["sessionId"] = "usurper-session-999"
@@ -576,7 +718,12 @@ for line in sys.stdin:
     elif method == "session/prompt":
         text = ((params.get("prompt") or [{}])[0].get("text") or "")
         log(row)
-        response = VALID if "malformed JSON" in text else MALFORMED
+        if MODE == "duplicate_wrong_id":
+            with open(log_path, encoding="utf-8") as fh:
+                prompts = sum(json.loads(line).get("method") == "session/prompt" for line in fh)
+            response = VALID if prompts == 1 else MALFORMED
+        else:
+            response = VALID if "malformed JSON" in text else MALFORMED
         emit({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -643,6 +790,23 @@ def test_strict_regeneration_wire_never_prompts_foreign_session(monkeypatch, tmp
     # The only prompt ever sent is the original malformed generation; the
     # strict regeneration was blocked before session/prompt crossed the wire.
     assert len([row for row in rows if row["method"] == "session/prompt"]) == 1
+
+
+def test_duplicate_regeneration_wire_never_prompts_foreign_session(monkeypatch, tmp_path) -> None:
+    module, _, _ = _load(monkeypatch)
+    client = _wire_client(module, tmp_path, "duplicate_wrong_id")
+    with pytest.raises(RuntimeError, match="strict same-session"):
+        client.chat.completions.create(
+            model="gemini-3.1-pro", messages=_duplicate_messages(),
+            tools=[_tool_schema("read_state"), _tool_schema("read_file")],
+        )
+    rows = _wire_rows(tmp_path)
+    prompts = [row for row in rows if row["method"] == "session/prompt"]
+    resumes = [row for row in rows if row["method"] == "session/resume"]
+    assert len(prompts) == 2
+    assert len(resumes) == 1
+    assert resumes[0]["params"]["sessionId"] == prompts[1]["params"]["sessionId"]
+    assert all(row["params"]["sessionId"] != "usurper-session-999" for row in prompts)
 
 
 def test_strict_regeneration_wire_accepts_resume_omitting_session_id(monkeypatch, tmp_path) -> None:
