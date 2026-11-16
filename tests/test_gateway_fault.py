@@ -16,7 +16,7 @@ def good_receipt():
     record = evidence.GatewayEvidenceTests().receipt()
     record.update(status="FAIL", run_id="123", run_attempt="1", checkout_sha=CANDIDATE,
                   fault_observation={"scenario": "prompt_held_driver_error", "held_tree_live": True},
-                  cleanup_diagnostics={"owner_exit": "zero", "forced_reasons": [],
+                  cleanup_diagnostics={"owner_exit": "zero", "forced_reasons": [], "owner_exit_seconds": 12.5,
                                        "fixture_exit": {"status": "complete", "unmet": []}})
     for name in ("permission_denial", "cancellation", "ownership_conflict", "owner_survives"):
         record["stages"][name] = {"status": "NOT_RUN", "detail": "not_executed"}
@@ -74,6 +74,8 @@ def test_contradictory_or_incomplete_evidence_is_rejected():
         mutants.append(value_record)
     for section, key, value in (("fault_observation", "held_tree_live", False),
                                 ("cleanup_diagnostics", "owner_exit", "signal"),
+                                ("cleanup_diagnostics", "owner_exit_seconds", None),
+                                ("cleanup_diagnostics", "owner_exit_seconds", 0),
                                 ("cleanup_diagnostics", "forced_reasons", ["fixture_child_alive"]),
                                 ("docker_execution", "container_removed", False),
                                 ("docker_execution", "image_removed", False),

@@ -533,16 +533,23 @@ class Run:
     def cleanup(self) -> None:
         forced = False
         forced_reasons: set[str] = set()
-        for role, process in (("contender", self.contender), ("owner", self.process)):
+        owner_exit_seconds: float | None = None
+        # Core's documented busy-shutdown leash is drain(0)+watchdog grace(60s); a gateway
+        # interrupted while a run is active may legitimately use it. The grace must exceed
+        # that contract or the harness SIGKILLs a gateway that was exiting on schedule.
+        for role, process, grace in (("contender", self.contender, 20), ("owner", self.process, 75)):
             if process is not None and process.poll() is None:
+                signal_started = time.monotonic()
                 process.send_signal(signal.SIGINT)
                 try:
-                    process.wait(timeout=20)
+                    process.wait(timeout=grace)
                 except subprocess.TimeoutExpired:
                     forced = True
                     forced_reasons.add("contender_sigint_timeout" if role == "contender" else "owner_sigint_timeout")
                     os.killpg(process.pid, signal.SIGKILL)  # only our Popen session, never a host scan
                     process.wait(timeout=5)
+                if role == "owner":
+                    owner_exit_seconds = round(time.monotonic() - signal_started, 3)
         fixture_wait_started = time.monotonic()
         fixture_deadline = fixture_wait_started + 5
         while True:
@@ -612,6 +619,7 @@ class Run:
                       "zero" if returncode == 0 else "signal" if returncode < 0 else "nonzero")
         self.record["cleanup_diagnostics"] = {
             "forced_reasons": sorted(forced_reasons), "owner_exit": exit_class,
+            "owner_exit_seconds": owner_exit_seconds,
             "fixture_exit": {"status": "not_observed" if not fixture_ids else "timeout" if fixture_unmet else "complete",
                              "elapsed_seconds": fixture_elapsed, "unmet": fixture_unmet}}
         if self.process is not None:

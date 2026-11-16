@@ -99,6 +99,26 @@ The observed current official Core contender contract is a successful no-op:
 requires the original owner PID and unchanged lock plus a subsequent real request;
 exit zero alone is insufficient. This is safe reuse, not rejection.
 
+## Fault-cleanup negative lane (Issue #41)
+
+One deterministic injected failure runs inside the same verified Docker boundary, in a
+non-blocking lane (`.github/workflows/gateway-fault.yml`) that triggers only on Gateway
+harness changes. After `initialize`, the driver admits a synthetic run, waits until the
+fake ACP peer holds the prompt with the owned server+grandchild tree verified live, then
+raises `injected_fault_while_prompt_held`. The expected receipt is a FAIL: exactly ten
+stages PASS, four post-injection stages stay `NOT_RUN`, `injected_fault` FAILs, and
+`scripts/gateway_fault_check.py` certifies only detection plus containment — graceful
+owner exit (`zero`, no forced reasons, measured positive `owner_exit_seconds`), complete
+fixture shutdown, container/image removal read-back, and a PID1-only final namespace.
+A falsely successful or contradictory receipt is rejected; the failed operation is never
+relabeled as success.
+
+First hosted run `43873946068` proved the checker rejects false PASS: it refused a receipt
+whose owner was SIGKILLed at the harness's 20-second idle-gateway grace while Core was
+still inside its documented busy-shutdown leash (drain 0 + watchdog grace 60 s,
+`gateway/shutdown_watchdog.py`). The harness grace was realigned to that contract
+(owner 75 s; contender unchanged at 20 s); every fail-closed invariant is unchanged.
+
 ## Validation responsibility contract v2 (PR #39 redesign)
 
 The operator explicitly approved removing full in-container pytest as a Gateway
