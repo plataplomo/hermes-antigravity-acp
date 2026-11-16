@@ -19,6 +19,7 @@ import asyncio
 import atexit
 import base64
 import contextlib
+import contextvars
 import hashlib
 import itertools
 from importlib import import_module
@@ -59,6 +60,7 @@ from .hermes_compat import (
 )
 from .native_limit_state import native_limit_registry
 from .process_teardown import terminate_process_tree
+from .request_trace import get_tracer, silence_seconds
 from .bridge import (
     MalformedToolCallError,
     advertised_tool_names,
@@ -3833,6 +3835,78 @@ def _drain_parked_inbox(inbox: queue.Queue) -> None:
             return
 
 
+# Stage tracing (issue #26, independent review item 1): the request key is
+# scoped to one completion call, not to the reusable client instance. A
+# ContextVar gives each thread/asyncio-task its own value, so sequential or
+# concurrent calls on one instance never share a correlation key, while
+# nested internals of the same call (corrections, failover replays) reuse
+# it. Empty means "outside any traced completion scope".
+_TRACE_REQUEST_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "antigravity_acp_trace_request_key", default=""
+)
+
+# Independent review item 2: only the ACP spec's stop reasons are traceable.
+# Anything else a (malformed or hostile) server reports is recorded as the
+# fixed token "unrecognized"; the raw string never enters the trace.
+_ACP_STOP_REASONS = frozenset(
+    {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}
+)
+
+# Server-reported effective model ids are surface names, but the value is
+# still server-authored (and the requested id is caller-supplied): a shape
+# gate alone would echo UUIDs, OAuth tokens (ya29./ya41.) and API keys
+# (sk-/ghp_/AIza/...) verbatim. Deny credential-shaped values explicitly.
+_MODEL_SURFACE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}\Z")
+_MODEL_DENY_RE = re.compile(
+    r"(?:"
+    r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"  # UUID
+    r"|[0-9a-fA-F]{28,}"  # dashless UUID / long hex blob
+    r"|[A-Za-z0-9]{24,}"  # long unbroken blob (AIzaSy..., random key)
+    r"|(?:^|[-_.:/])ya\d+[._:/-]"  # OAuth access/refresh token prefix
+    r"|(?:^|[-_.:/])(?:sk|pk|gh[pousr]|xox[a-z]?|AIza|ASIA|AKIA)"
+    r"(?:[-_]|(?=[A-Za-z0-9]{16,}))"  # API-key shapes
+    r")"
+)
+
+
+def _classify_acp_stop_reason(payload: Any) -> str:
+    raw = (
+        str(payload.get("stopReason") or "").strip()
+        if isinstance(payload, dict)
+        else ""
+    )
+    if not raw:
+        return "unreported"
+    return raw if raw in _ACP_STOP_REASONS else "unrecognized"
+
+
+def _classify_model_surface(value: Any) -> str:
+    """Non-disclosing representation for a model id in the trace.
+
+    Ordinary model names are recorded verbatim so requested-vs-effective
+    substitution stays directly comparable. Anything credential-shaped or
+    otherwise unrecognizable is replaced by a request-scoped salted
+    fingerprint: irreversible, unlinkable across requests (the salt is the
+    ephemeral per-request key), yet still comparable inside the one event
+    where the requested/effective pair is written. Outside any request
+    scope there is no comparable identity to offer, so ``unrecognized``.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "unreported"
+    if _MODEL_SURFACE_RE.match(text) and not _MODEL_DENY_RE.search(text):
+        return text
+    request_key = _TRACE_REQUEST_KEY.get()
+    if not request_key:
+        return "unrecognized"
+    digest = hashlib.sha256(
+        f"antigravity-acp-model-surface\0{request_key}\0{text}".encode(
+            "utf-8", errors="surrogatepass"
+        )
+    ).hexdigest()
+    return "opaque:" + digest[:16]
+
+
 class AntigravityACPClient:
     """OpenAI-client-compatible facade backed by Google's official ACP process.
 
@@ -3912,6 +3986,59 @@ class AntigravityACPClient:
         # CURRENT value, so a cancel is never sticky for later requests on a
         # reused instance. Guarded by _active_process_lock.
         self._cancel_epoch = 0
+        # Stage tracing (issue #26): None unless explicitly opted in, so the
+        # disabled path costs one ``is None`` check per hook. The request key
+        # is scoped per completion call through ``_TRACE_REQUEST_KEY`` (an
+        # ephemeral salted hash from fresh uuid4 material, never a global
+        # identifier); nothing is keyed to the reusable instance.
+        self._trace = get_tracer()
+        # attempt_key -> (request_key, child pid) for in-flight sessions;
+        # guarded by _active_process_lock so cancel() (interrupt thread) can
+        # attribute cancel_requested to the exact attempt and join its
+        # request key without touching the request loop.
+        self._trace_inflight: dict[str, tuple[str, int]] = {}
+
+    def _begin_trace_request(self) -> contextvars.Token[str] | None:
+        """Open a per-completion-call trace scope (issue #26 review item 1).
+
+        Returns a reset token when this call opened the scope, or ``None``
+        when tracing is disabled or an enclosing completion call already
+        opened one (corrections and failover replays stay inside the same
+        request key).
+        """
+        if self._trace is None or _TRACE_REQUEST_KEY.get():
+            return None
+        return _TRACE_REQUEST_KEY.set(
+            _opaque_permission_id(uuid.uuid4().hex, "trace-request") or ""
+        )
+
+    @staticmethod
+    def _end_trace_request(token: contextvars.Token[str] | None) -> None:
+        if token is not None:
+            _TRACE_REQUEST_KEY.reset(token)
+
+    def _trace_event(
+        self,
+        stage: str,
+        *,
+        req_key: str = "",
+        pid: int | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit one stage-trace line (issue #26). No-op unless opted in.
+
+        ``detail`` must carry only non-sensitive classification values; the
+        tracer's sanitizer is a second line of defense, not the guarantee.
+        """
+        tracer = self._trace
+        if tracer is None:
+            return
+        tracer.emit(
+            stage=stage,
+            req_key=req_key or _TRACE_REQUEST_KEY.get() or "unknown",
+            pid=pid,
+            detail=detail,
+        )
 
     @staticmethod
     def _terminate_process(
@@ -4041,6 +4168,22 @@ class AntigravityACPClient:
         with self._active_process_lock:
             self._cancel_epoch += 1
             procs = tuple(self._active_processes)
+            inflight_trace = dict(self._trace_inflight)
+        if self._trace is not None:
+            # cancel_requested (issue #26) records OUR action only: whether
+            # the vendor stopped compute is not observable here and is never
+            # claimed. The stored request key joins the cancel (interrupt
+            # thread) back to the completion call that owned the attempt.
+            for _attempt_key, (_req_key, _pid) in inflight_trace.items():
+                self._trace_event(
+                    "cancel_requested",
+                    req_key=_attempt_key,
+                    pid=_pid or None,
+                    detail={
+                        "source": "hermes_interrupt",
+                        "request_key": _req_key or "unknown",
+                    },
+                )
         if len(procs) > 1:
             logger.warning(
                 "Antigravity ACP cancel() found %d concurrent sessions on one client"
@@ -4051,6 +4194,36 @@ class AntigravityACPClient:
             self._terminate_process(proc)
 
     def _create_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        reasoning_effort: Any = None,
+        **_: Any,
+    ) -> Any:
+        # Stage tracing (issue #26, review item 1): one completion call is
+        # one request scope. The key lives in a ContextVar so a reused
+        # instance never merges two calls' events, and nested internals
+        # (corrections, failover replays, the _run_prompt below) reuse it.
+        trace_token = self._begin_trace_request()
+        try:
+            return self._create_chat_completion_traced(
+                model=model,
+                messages=messages,
+                timeout=timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                reasoning_effort=reasoning_effort,
+            )
+        finally:
+            self._end_trace_request(trace_token)
+
+    def _create_chat_completion_traced(
         self,
         *,
         model: str | None = None,
@@ -4183,6 +4356,22 @@ class AntigravityACPClient:
                     affinity_key=affinity_key,
                     intent_owner=intent_owner,
                     tool_outcome=tool_outcome,
+                )
+            if self._trace is not None and replay_reason in (
+                "frontier_mismatch",
+                "rotation",
+            ):
+                # Replay decisions are client-side and directly observable
+                # (issue #26): record the class and the resend cost in bytes,
+                # never the fingerprint inputs or prompt content.
+                self._trace_event(
+                    "retry_attempt",
+                    detail={
+                        "reason": replay_reason,
+                        "prompt_bytes": len(
+                            full_prompt_text.encode("utf-8", errors="replace")
+                        ),
+                    },
                 )
     
             timeout_seconds = _effective_timeout(timeout)
@@ -4589,6 +4778,12 @@ class AntigravityACPClient:
             else "0"
         )
         child_env["ACP_MUX_AFFINITY_PIN"] = "1" if pin_affinity else "0"
+        # Stage tracing (issue #26): the child env filter strips operator
+        # ACP_MUX_* keys by design, so mux trace enablement must be explicit
+        # here (a plugin-owned constant, never an inherited value). The mux
+        # writes its own bounded trace file; pids are the join key.
+        if self._trace is not None:
+            child_env["ACP_MUX_TRACE"] = "1"
         child_env["ACP_MUX_AFFINITY_TTL_SECONDS"] = os.environ.get(
             "HERMES_ANTIGRAVITY_ACP_STATE_TTL_SECONDS", "86400"
         )
@@ -4701,6 +4896,22 @@ class AntigravityACPClient:
         inbox = entry["inbox"]
         stderr_tail = entry["stderr_tail"]
         stderr_reader = entry["stderr_reader"]
+        # Stage tracing (issue #26): one ephemeral attempt key per ACP session
+        # attempt joins this attempt's lifecycle events; the per-instance
+        # request key (carried in detail.request_key) joins the attempts of one
+        # logical request. Zero work when tracing is disabled.
+        trace = self._trace
+        attempt_key = (
+            (_opaque_permission_id(uuid.uuid4().hex, "trace-attempt") or "")
+            if trace is not None
+            else ""
+        )
+        if trace is not None:
+            with self._active_process_lock:
+                self._trace_inflight[attempt_key] = (
+                    _TRACE_REQUEST_KEY.get(),
+                    int(proc.pid or 0),
+                )
         # JSON-RPC ids must stay unique for the lifetime of one stdio
         # connection, so the counter continues across parked sessions.
         id_state = {"last": entry["next_id"] - 1}
@@ -4733,6 +4944,18 @@ class AntigravityACPClient:
             reasoning_parts: list[str] | None = None,
         ) -> Any:
             assert proc.stdin is not None
+            # Stage-trace wait-loop state (issue #26); only the prompt request
+            # heartbeats, so the threshold is armed for that method alone.
+            prompt_sent_at = 0.0
+            first_update_seen = False
+            last_protocol_event = time.monotonic()
+            silence_threshold = (
+                silence_seconds()
+                if (trace is not None and method == "session/prompt")
+                else 0.0
+            )
+            silence_deadline = last_protocol_event + silence_threshold
+            silence_heartbeats = 0
             request_id = next(request_ids)
             id_state["last"] = request_id
             if method == "session/prompt":
@@ -4768,6 +4991,42 @@ class AntigravityACPClient:
                     + "\n"
                 )
                 proc.stdin.flush()
+                if trace is not None and method == "session/prompt":
+                    prompt_sent_at = time.monotonic()
+                    self._trace_event(
+                        "prompt_sent",
+                        req_key=attempt_key,
+                        pid=proc.pid,
+                        detail={
+                            "turn_id_hash": activity_stats.get("turn_id_hash"),
+                            "session_id_hash": activity_stats.get("session_id_hash"),
+                            "requested_model": (
+                                _classify_model_surface(
+                                    activity_stats.get("requested_model")
+                                )
+                                if activity_stats.get("requested_model")
+                                else "unspecified"
+                            ),
+                            "effective_model": _classify_model_surface(
+                                activity_stats.get("model")
+                            ),
+                            # Byte count only; prompt text is never recorded.
+                            # UTF-8 encoded bytes, not code points (review
+                            # item 3): the number must match wire cost.
+                            "prompt_text_bytes": sum(
+                                len(
+                                    str(block.get("text") or "").encode(
+                                        "utf-8", errors="replace"
+                                    )
+                                )
+                                for block in params.get("prompt") or ()
+                                if isinstance(block, dict)
+                            ),
+                            "request_key": (
+                                _TRACE_REQUEST_KEY.get() or "unknown"
+                            ),
+                        },
+                    )
             except BrokenPipeError:
                 if _cancelled():
                     raise _AcpCancelledError(
@@ -4782,7 +5041,55 @@ class AntigravityACPClient:
                 try:
                     message = inbox.get(timeout=0.1)
                 except queue.Empty:
+                    if (
+                        trace is not None
+                        and silence_threshold > 0
+                        and silence_heartbeats < 8
+                        and time.monotonic() >= silence_deadline
+                    ):
+                        # Silence rule (issue #26): no protocol event has been
+                        # observed for the (doubling) threshold. The vendor
+                        # cause is NOT observable here, so the record carries
+                        # an explicit unknown — never a fabricated 503, retry
+                        # count, or queue position.
+                        silence_heartbeats += 1
+                        self._trace_event(
+                            "unknown",
+                            req_key=attempt_key,
+                            pid=proc.pid,
+                            detail={
+                                "classification": (
+                                    "waiting_for_upstream_no_protocol_events"
+                                ),
+                                "waiting_on": method,
+                                "silent_seconds": round(
+                                    time.monotonic() - last_protocol_event, 1
+                                ),
+                                "vendor_cause": "unknown",
+                            },
+                        )
+                        silence_deadline += min(
+                            silence_threshold * (2 ** silence_heartbeats), 3600.0
+                        )
                     continue
+                last_protocol_event = time.monotonic()
+                if (
+                    trace is not None
+                    and not first_update_seen
+                    and method == "session/prompt"
+                    and message.get("method") == "session/update"
+                ):
+                    first_update_seen = True
+                    self._trace_event(
+                        "first_update",
+                        req_key=attempt_key,
+                        pid=proc.pid,
+                        detail={
+                            "elapsed_ms": int(
+                                (time.monotonic() - prompt_sent_at) * 1000
+                            ),
+                        },
+                    )
                 if self._handle_server_message(
                     message,
                     process=proc,
@@ -4809,7 +5116,41 @@ class AntigravityACPClient:
                     diagnostic = f"Antigravity ACP {method} failed"
                     if details:
                         diagnostic += ": " + "; ".join(details)
+                    if trace is not None and method == "session/prompt":
+                        self._trace_event(
+                            "prompt_response",
+                            req_key=attempt_key,
+                            pid=proc.pid,
+                            detail={
+                                "outcome": "jsonrpc_error",
+                                "error_code": (
+                                    code if isinstance(code, int) else "unreported"
+                                ),
+                                "elapsed_ms": int(
+                                    (time.monotonic() - prompt_sent_at) * 1000
+                                ),
+                            },
+                        )
                     raise RuntimeError(diagnostic)
+                if trace is not None and method == "session/prompt":
+                    prompt_result_payload = message.get("result")
+                    self._trace_event(
+                        "prompt_response",
+                        req_key=attempt_key,
+                        pid=proc.pid,
+                        detail={
+                            "outcome": "completed",
+                            "stop_reason": _classify_acp_stop_reason(
+                                prompt_result_payload
+                            ),
+                            "elapsed_ms": int(
+                                (time.monotonic() - prompt_sent_at) * 1000
+                            ),
+                            "session_updates": int(
+                                activity_stats.get("session_updates") or 0
+                            ),
+                        },
+                    )
                 return message.get("result")
             if _cancelled():
                 # The loop exited on the deadline/poll race while a cancel was
@@ -4818,6 +5159,16 @@ class AntigravityACPClient:
                     "Antigravity ACP request cancelled by Hermes interrupt."
                 )
             if proc.poll() is not None:
+                if trace is not None:
+                    self._trace_event(
+                        "process_exit",
+                        req_key=attempt_key,
+                        pid=proc.pid,
+                        detail={
+                            "exit_code": proc.poll(),
+                            "waiting_on": method,
+                        },
+                    )
                 # The child is gone; give the pump a bounded moment to drain
                 # the pipe so the captured-tail summary is deterministic.
                 stderr_reader.join(timeout=2.0)
@@ -4835,6 +5186,17 @@ class AntigravityACPClient:
                         "if more detail is required.",
                         acp_retry_class=_acp_stderr_retry_class(list(stderr_tail)),
                     )
+            if trace is not None:
+                self._trace_event(
+                    "unknown",
+                    req_key=attempt_key,
+                    pid=proc.pid,
+                    detail={
+                        "classification": "deadline_exceeded",
+                        "waiting_on": method,
+                        "vendor_cause": "unknown",
+                    },
+                )
             raise TimeoutError(
                 f"Timed out waiting for Antigravity ACP response to {method}."
             )
@@ -4842,7 +5204,19 @@ class AntigravityACPClient:
         poisoned = False
         try:
             if fresh:
+                initialize_started = time.monotonic()
                 initialize_result = request("initialize", _INITIALIZE_PARAMS)
+                self._trace_event(
+                    "initialize",
+                    req_key=attempt_key,
+                    pid=proc.pid,
+                    detail={
+                        "elapsed_ms": int(
+                            (time.monotonic() - initialize_started) * 1000
+                        ),
+                        "request_key": _TRACE_REQUEST_KEY.get() or "unknown",
+                    },
+                )
                 # Pin the server's consumption semantics for the lifetime of
                 # this stdio connection (issue #6 AC4-3); warm reuse of the
                 # same process keeps the pinned identity.
@@ -4901,6 +5275,19 @@ class AntigravityACPClient:
                 session = request("session/new", new_params) or {}
             if not str(session.get("sessionId") or "").strip():
                 raise RuntimeError("Antigravity ACP did not return a sessionId.")
+            if trace is not None:
+                self._trace_event(
+                    "session_new_or_resume",
+                    req_key=attempt_key,
+                    pid=proc.pid,
+                    detail={
+                        "branch": "resume" if resume_session_id else "new",
+                        "session_id_hash": _opaque_permission_id(
+                            session.get("sessionId"), "session"
+                        ),
+                        "request_key": _TRACE_REQUEST_KEY.get() or "unknown",
+                    },
+                )
             yield session, request, activity_stats
         except (TimeoutError, _AcpEarlyExitError, BrokenPipeError, OSError):
             # Transport-level failure: the connection's state is unknown and
@@ -4916,6 +5303,9 @@ class AntigravityACPClient:
             poisoned = True
             raise
         finally:
+            if trace is not None:
+                with self._active_process_lock:
+                    self._trace_inflight.pop(attempt_key, None)
             entry["next_id"] = id_state["last"] + 1
             if poisoned or proc.poll() is not None:
                 self._release_process(proc)
@@ -5001,6 +5391,17 @@ class AntigravityACPClient:
                     response_text, tools
                 )
             except MalformedToolCallError as exc:
+                # Local response-rejection classification (issue #26): the
+                # guard class is directly observable here; the discarded
+                # response text never is and is never recorded.
+                self._trace_event(
+                    "response_rejected",
+                    detail={
+                        "classification": str(exc.reason or "malformed_tool_call"),
+                        "unrecoverable": bool(exc.unrecoverable),
+                        "attempt": corrections + 1,
+                    },
+                )
                 if exc.unrecoverable:
                     if exc.reason == "unadvertised_tool":
                         raise RuntimeError(str(exc)) from exc
@@ -5009,6 +5410,14 @@ class AntigravityACPClient:
                         "outcome is UNKNOWN, refusing to replay any action or expose the result."
                     ) from exc
                 if budget[0] <= 0:
+                    self._trace_event(
+                        "response_rejected",
+                        detail={
+                            "classification": "correction_exhausted",
+                            "unrecoverable": True,
+                            "attempt": corrections,
+                        },
+                    )
                     count_word = {0: "no", 1: "one", 2: "two"}.get(
                         corrections, str(corrections)
                     )
@@ -5034,6 +5443,10 @@ class AntigravityACPClient:
                     ) from exc
                 budget[0] -= 1
                 corrections += 1
+                self._trace_event(
+                    "retry_attempt",
+                    detail={"reason": "malformed_correction", "attempt": corrections},
+                )
                 correction_full_prompt = (
                     f"{full_prompt_text}\n\nPrevious malformed model output (not executed):\n{response_text}"
                     f"\n\n{_MALFORMED_TOOL_CALL_CORRECTION}"
@@ -5097,7 +5510,46 @@ class AntigravityACPClient:
         and a response reported under a different session id than pinned is
         rejected. Used only by malformed tool-call regeneration; the ordinary
         conversation transport policy is untouched.
+
+        Stage tracing (issue #26, review item 1): opens a request scope when
+        entered directly (e.g. as the completion entry in tests); inside a
+        completion call it reuses the enclosing request key.
         """
+        trace_token = self._begin_trace_request()
+        try:
+            return self._run_prompt_traced(
+                prompt_text,
+                timeout_seconds=timeout_seconds,
+                model=model,
+                affinity_key=affinity_key,
+                resume_session_id=resume_session_id,
+                full_prompt_text=full_prompt_text,
+                session_result=session_result,
+                native_token_hint=native_token_hint,
+                image_blocks=image_blocks,
+                replay_image_blocks=replay_image_blocks,
+                thinking_level=thinking_level,
+                strict_same_session=strict_same_session,
+            )
+        finally:
+            self._end_trace_request(trace_token)
+
+    def _run_prompt_traced(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+        affinity_key: str = "",
+        resume_session_id: str = "",
+        full_prompt_text: str | None = None,
+        session_result: dict[str, Any] | None = None,
+        native_token_hint: int = 0,
+        image_blocks: tuple[dict[str, str], ...] = (),
+        replay_image_blocks: tuple[dict[str, str], ...] = (),
+        thinking_level: str | None = None,
+        strict_same_session: bool = False,
+    ) -> tuple[str, str]:
         deadline = time.monotonic() + timeout_seconds
         replay_text = full_prompt_text or prompt_text
         next_text = prompt_text
@@ -5179,6 +5631,10 @@ class AntigravityACPClient:
                     _log_full_replay_diagnostics(
                         reason="resume_miss", prompt_text=replay_text, model=model, affinity_key=affinity_key
                     )
+                    self._trace_event(
+                        "retry_attempt",
+                        detail={"reason": "resume_miss", "attempt": 1},
+                    )
                     next_text = replay_text
                     next_resume = ""
                     next_image_blocks = replay_image_blocks
@@ -5215,6 +5671,10 @@ class AntigravityACPClient:
                     # retries beyond a single lane switch.
                     inband_digest_replays += 1
                 failovers += 1
+                self._trace_event(
+                    "retry_attempt",
+                    detail={"reason": "transport_failover", "attempt": failovers},
+                )
                 logger.warning(
                     "Antigravity ACP failover attempt %d/%d; starting a fresh ACP session.",
                     failovers,
@@ -5396,6 +5856,11 @@ class AntigravityACPClient:
             activity_stats["model"] = str(
                 effective_model or requested_model or model or "antigravity-acp"
             )
+            # Stage trace (issue #26): model ids are server-authored or
+            # caller-advertised surface names, never sensitive material; the
+            # requested-vs-effective pair distinguishes a silent model
+            # substitution from a plain slow turn.
+            activity_stats["requested_model"] = requested_model
             if session_result is not None:
                 session_result.update(
                     phase="session/prompt",
