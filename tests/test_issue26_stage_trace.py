@@ -51,9 +51,34 @@ FORBIDDEN_SUBSTRINGS = (
     "access_token",
     "refresh_token",
     "Bearer",
-    "503",
-    "No capacity",
 )
+# Vendor-error tokens are scanned only over stage/detail fields: a salted
+# correlation hash is random hex and may contain any short decimal string
+# ("503" included) by pure chance — that is not a vendor claim.
+FORBIDDEN_VENDOR_TOKENS = ("503", "No capacity", "capacity", "queue position")
+
+
+def _vendor_token_scan_text(records: list[dict]) -> str:
+    def strip_hashes(value):
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "<hash>"
+                    if key.endswith("_hash") or key == "request_key"
+                    else strip_hashes(item)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [strip_hashes(item) for item in value]
+        return value
+
+    return json.dumps(
+        [
+            {"stage": r["stage"], "detail": strip_hashes(r["detail"])}
+            for r in records
+        ]
+    ).lower()
 
 
 def _load_plugin(monkeypatch, tmp_path: Path, *, trace: bool):
@@ -198,10 +223,13 @@ def _read_trace(path: Path, trace_module) -> list[dict]:
     return records
 
 
-def _assert_no_leaks(text: str, tmp_path: Path) -> None:
+def _assert_no_leaks(text: str, tmp_path: Path, records: list[dict]) -> None:
     for forbidden in FORBIDDEN_SUBSTRINGS:
         assert forbidden not in text, forbidden
     assert str(tmp_path) not in text
+    scan = _vendor_token_scan_text(records)
+    for forbidden in FORBIDDEN_VENDOR_TOKENS:
+        assert forbidden not in scan, forbidden
 
 
 def _wait_for_file(predicate, timeout=10.0) -> bool:
@@ -262,7 +290,7 @@ def test_normal_lifecycle_trace(monkeypatch, tmp_path):
     assert response_event["detail"]["stop_reason"] == "end_turn"
     assert response_event["detail"]["session_updates"] >= 1
     _assert_no_leaks(
-        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path
+        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
     )
 
 
@@ -305,11 +333,13 @@ def test_silence_is_unknown_never_vendor_503(monkeypatch, tmp_path):
     ]
     assert deadline_events
     assert deadline_events[0]["detail"]["vendor_cause"] == "unknown"
-    # The silence rule: nothing in the trace may imply a vendor error class.
-    assert "503" not in text
-    assert "capacity" not in text.lower()
-    assert "retry" not in text.lower()
-    _assert_no_leaks(text, tmp_path)
+    # The silence rule: nothing in the trace fields may imply a vendor
+    # error class (hash fields excluded: random hex may contain digits).
+    scan = _vendor_token_scan_text(records)
+    assert "503" not in scan
+    assert "capacity" not in scan
+    assert "retry" not in scan
+    _assert_no_leaks(text, tmp_path, records)
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +382,7 @@ def test_cancel_path_records_cancel_requested(monkeypatch, tmp_path):
         assert cancel_events[0]["pid"] == prompt_events[0]["pid"]
         assert cancel_events[0]["detail"]["source"] == "hermes_interrupt"
         _assert_no_leaks(
-            (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path
+            (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
         )
     finally:
         client.close()
@@ -448,7 +478,7 @@ def test_local_rejection_and_retry_classification(monkeypatch, tmp_path):
     assert rejected[0]["req_key"] == client._trace_request_key
     assert retried[0]["req_key"] == client._trace_request_key
     _assert_no_leaks(
-        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path
+        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
     )
 
 
@@ -508,7 +538,7 @@ def test_frontier_mismatch_replay_is_classified(monkeypatch, tmp_path):
     # Only the byte cost is recorded, never the fingerprint inputs.
     assert "fingerprint" not in json.dumps(replays[0])
     _assert_no_leaks(
-        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path
+        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
     )
 
 
@@ -567,7 +597,7 @@ def test_concurrent_requests_disjoint_req_keys(monkeypatch, tmp_path):
             ]
             assert any(len(stages) >= 5 for stages in per_key)
         _assert_no_leaks(
-            (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path
+            (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
         )
     finally:
         client_a.close()
