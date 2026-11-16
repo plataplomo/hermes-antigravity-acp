@@ -43,10 +43,18 @@ TRACE_SILENCE_ENV = "HERMES_ANTIGRAVITY_ACP_TRACE_SILENCE_SECONDS"
 SECRET_SESSION_ID = "fake-session-SECRETSESSION0001"
 SECRET_PROMPT_MARKER = "SECRET-PROMPT-MARKER-DO-NOT-LOG"
 SECRET_LABEL = "sensitive-account-label"
+# Adversarial stopReason payload (review item 2): a hostile/malformed server
+# string that must never cross the trace privacy boundary verbatim.
+HOSTILE_STOP_REASON = (
+    "IGNORE-PREVIOUS-INSTRUCTIONS sk-SECRET-STOPREASON-9137 "
+    "fake-session-SECRETSESSION0001"
+)
 FORBIDDEN_SUBSTRINGS = (
     SECRET_SESSION_ID,
     SECRET_PROMPT_MARKER,
     SECRET_LABEL,
+    "sk-SECRET-STOPREASON-9137",
+    "IGNORE-PREVIOUS-INSTRUCTIONS",
     "ya29.",
     "access_token",
     "refresh_token",
@@ -206,6 +214,10 @@ for line in sys.stdin:
         elif mode == "malformed" and turn == 1:
             chunk('<tool_call>{"id": "call-bad", "type": "function", "function": {"name": "read_file", "arguments": "{bad')
             emit({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+        elif mode == "hostile":
+            chunk("done")
+            emit({"jsonrpc": "2.0", "id": mid,
+                  "result": {"stopReason": "IGNORE-PREVIOUS-INSTRUCTIONS sk-SECRET-STOPREASON-9137 fake-session-SECRETSESSION0001"}})
         else:
             chunk("done")
             emit({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
@@ -385,6 +397,13 @@ def test_cancel_path_records_cancel_requested(monkeypatch, tmp_path):
         assert cancel_events[0]["req_key"] == prompt_events[0]["req_key"]
         assert cancel_events[0]["pid"] == prompt_events[0]["pid"]
         assert cancel_events[0]["detail"]["source"] == "hermes_interrupt"
+        # The cancel (interrupt thread) still joins the request key of the
+        # attempt it stopped, despite running outside the request context.
+        assert (
+            cancel_events[0]["detail"]["request_key"]
+            == prompt_events[0]["detail"]["request_key"]
+        )
+        assert prompt_events[0]["detail"]["request_key"] != "unknown"
         _assert_no_leaks(
             (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
         )
@@ -478,9 +497,10 @@ def test_local_rejection_and_retry_classification(monkeypatch, tmp_path):
     assert len(retried) == 1
     assert retried[0]["detail"]["reason"] == "malformed_correction"
     assert retried[0]["detail"]["attempt"] == 1
-    # Rejection/retry events join back to this instance's request key.
-    assert rejected[0]["req_key"] == client._trace_request_key
-    assert retried[0]["req_key"] == client._trace_request_key
+    # Rejection/retry events join the request key of the completion call
+    # that produced them (per-call scope, not per-instance).
+    assert rejected[0]["req_key"] == retried[0]["req_key"]
+    assert rejected[0]["req_key"] not in ("", "unknown")
     _assert_no_leaks(
         (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
     )
@@ -538,7 +558,14 @@ def test_frontier_mismatch_replay_is_classified(monkeypatch, tmp_path):
     ]
     assert len(replays) == 1
     assert replays[0]["detail"]["prompt_bytes"] > 0
-    assert replays[0]["req_key"] == client._trace_request_key
+    # Per-call attribution: the frontier replay belongs to the SECOND
+    # completion call on this instance, not the first and not the instance.
+    sent = [r for r in records if r["stage"] == "prompt_sent"]
+    assert len(sent) == 2
+    call_keys = [r["detail"]["request_key"] for r in sent]
+    assert len(set(call_keys)) == 2
+    assert replays[0]["req_key"] == call_keys[1]
+    assert replays[0]["req_key"] != call_keys[0]
     # Only the byte cost is recorded, never the fingerprint inputs.
     assert "fingerprint" not in json.dumps(replays[0])
     _assert_no_leaks(
@@ -550,7 +577,6 @@ def test_concurrent_requests_disjoint_req_keys(monkeypatch, tmp_path):
     module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
     client_a, _ = _make_client(module, tmp_path, "normal")
     client_b, _ = _make_client(module, tmp_path, "normal")
-    assert client_a._trace_request_key != client_b._trace_request_key
     errors: list[BaseException] = []
 
     def run(client, marker: str) -> None:
@@ -570,36 +596,31 @@ def test_concurrent_requests_disjoint_req_keys(monkeypatch, tmp_path):
     try:
         assert not errors, errors
         records = _read_trace(tmp_path / "trace.jsonl", trace_module)
-        keys_a = {
-            r["req_key"]
-            for r in records
-            if r["detail"].get("request_key") == client_a._trace_request_key
-        }
-        keys_b = {
-            r["req_key"]
-            for r in records
-            if r["detail"].get("request_key") == client_b._trace_request_key
-        }
-        assert keys_a and keys_b
-        assert not (keys_a & keys_b), "concurrent requests must not share req_keys"
-        pids_a = {
-            r["pid"]
-            for r in records
-            if r["detail"].get("request_key") == client_a._trace_request_key
-        }
-        pids_b = {
-            r["pid"]
-            for r in records
-            if r["detail"].get("request_key") == client_b._trace_request_key
-        }
-        assert len(pids_a) == 1 and len(pids_b) == 1
-        assert pids_a != pids_b
-        # Every lifecycle stage of each request stayed on its own key.
-        for keys in (keys_a, keys_b):
-            per_key = [
-                [r["stage"] for r in records if r["req_key"] == key] for key in keys
-            ]
-            assert any(len(stages) >= 5 for stages in per_key)
+        # Derive each request's correlation identity from the trace itself:
+        # one prompt_sent per client, each pinned to its own child pid.
+        sent = [r for r in records if r["stage"] == "prompt_sent"]
+        assert len(sent) == 2
+        request_keys = {r["detail"]["request_key"] for r in sent}
+        assert len(request_keys) == 2, (
+            "concurrent requests must not share request keys"
+        )
+        assert all(k and k != "unknown" for k in request_keys)
+        attempt_keys = {r["req_key"] for r in sent}
+        assert len(attempt_keys) == 2
+        pids = {r["pid"] for r in sent}
+        assert len(pids) == 2
+        # Every lifecycle stage of each request stayed on its own attempt
+        # key and its own child process: no cross-request interleaving.
+        for sent_rec in sent:
+            mine = [r for r in records if r["req_key"] == sent_rec["req_key"]]
+            assert {r["pid"] for r in mine} == {sent_rec["pid"]}
+            assert {r["stage"] for r in mine} == {
+                "initialize",
+                "session_new_or_resume",
+                "prompt_sent",
+                "first_update",
+                "prompt_response",
+            }
         _assert_no_leaks(
             (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
         )
@@ -611,6 +632,99 @@ def test_concurrent_requests_disjoint_req_keys(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 # 6. Disabled tracing produces no trace output
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 5b. Same-instance request correlation (independent review, item 1)
+# ---------------------------------------------------------------------------
+
+
+def test_same_client_sequential_calls_get_distinct_request_keys(
+    monkeypatch, tmp_path,
+):
+    """Two completion calls on ONE client instance must not share a request key.
+
+    The client is explicitly reusable (warm session reuse, cancel-epoch
+    semantics), so grouping two calls under one correlation key would mix
+    their events and let one request's event budget consume another's.
+    """
+    module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
+    client, _ = _make_client(module, tmp_path, "normal")
+    try:
+        first, _ = client._run_prompt("first call", timeout_seconds=20.0)
+        second, _ = client._run_prompt("second call", timeout_seconds=20.0)
+    finally:
+        client.close()
+    assert first == "done" and second == "done"
+    records = _read_trace(tmp_path / "trace.jsonl", trace_module)
+    sent = [r for r in records if r["stage"] == "prompt_sent"]
+    responses = [r for r in records if r["stage"] == "prompt_response"]
+    assert len(sent) == 2 and len(responses) == 2
+    request_keys = [r["detail"]["request_key"] for r in sent]
+    assert all(k and k != "unknown" for k in request_keys), request_keys
+    assert len(set(request_keys)) == 2, (
+        "sequential calls on one client instance must carry distinct "
+        f"request keys: {request_keys}"
+    )
+    # Attempt grouping stays exact: each call's attempt key appears once in
+    # prompt_sent and once in prompt_response, in call order.
+    attempt_keys = [r["req_key"] for r in sent]
+    assert len(set(attempt_keys)) == 2
+    assert [r["req_key"] for r in responses] == attempt_keys
+    # The handshake events join the request that caused them (first call
+    # only, if the second call reused the warm session).
+    inits = [r for r in records if r["stage"] == "initialize"]
+    assert inits, "first call must record initialize"
+    assert inits[0]["detail"]["request_key"] == request_keys[0]
+    for init in inits[1:]:
+        assert init["detail"]["request_key"] in request_keys
+    _assert_no_leaks(
+        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
+    )
+
+
+def test_adversarial_stop_reason_recorded_as_unrecognized(monkeypatch, tmp_path):
+    """A hostile stopReason string must never enter the trace verbatim."""
+    module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
+    client, _ = _make_client(module, tmp_path, "hostile")
+    try:
+        answer, _ = client._run_prompt("hello", timeout_seconds=20.0)
+    finally:
+        client.close()
+    assert answer == "done"
+    records = _read_trace(tmp_path / "trace.jsonl", trace_module)
+    responses = [r for r in records if r["stage"] == "prompt_response"]
+    assert len(responses) == 1
+    assert responses[0]["detail"]["stop_reason"] == "unrecognized"
+    text = (tmp_path / "trace.jsonl").read_text(encoding="utf-8")
+    assert HOSTILE_STOP_REASON not in text
+    assert "IGNORE-PREVIOUS-INSTRUCTIONS" not in text
+    assert "sk-SECRET-STOPREASON-9137" not in text
+    _assert_no_leaks(text, tmp_path, records)
+
+
+def test_prompt_text_bytes_counts_utf8_bytes(monkeypatch, tmp_path):
+    """prompt_text_bytes is the UTF-8 encoded length, not code points."""
+    module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
+    client, _ = _make_client(module, tmp_path, "normal")
+    try:
+        client._run_prompt("abcd", timeout_seconds=20.0)
+        client._run_prompt("한글입니다", timeout_seconds=20.0)
+    finally:
+        client.close()
+    records = _read_trace(tmp_path / "trace.jsonl", trace_module)
+    sent = [r for r in records if r["stage"] == "prompt_sent"]
+    assert len(sent) == 2
+    assert sent[0]["detail"]["prompt_text_bytes"] == len(
+        "abcd".encode("utf-8")
+    )
+    assert sent[1]["detail"]["prompt_text_bytes"] == len(
+        "한글입니다".encode("utf-8")
+    )
+    assert sent[1]["detail"]["prompt_text_bytes"] == 15  # 5 × 3-byte Hangul
+    _assert_no_leaks(
+        (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
+    )
 
 
 def test_disabled_by_default_produces_no_file(monkeypatch, tmp_path):

@@ -19,6 +19,7 @@ import asyncio
 import atexit
 import base64
 import contextlib
+import contextvars
 import hashlib
 import itertools
 from importlib import import_module
@@ -3834,6 +3835,46 @@ def _drain_parked_inbox(inbox: queue.Queue) -> None:
             return
 
 
+# Stage tracing (issue #26, independent review item 1): the request key is
+# scoped to one completion call, not to the reusable client instance. A
+# ContextVar gives each thread/asyncio-task its own value, so sequential or
+# concurrent calls on one instance never share a correlation key, while
+# nested internals of the same call (corrections, failover replays) reuse
+# it. Empty means "outside any traced completion scope".
+_TRACE_REQUEST_KEY: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "antigravity_acp_trace_request_key", default=""
+)
+
+# Independent review item 2: only the ACP spec's stop reasons are traceable.
+# Anything else a (malformed or hostile) server reports is recorded as the
+# fixed token "unrecognized"; the raw string never enters the trace.
+_ACP_STOP_REASONS = frozenset(
+    {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}
+)
+
+# Server-reported effective model ids are surface names, but the value is
+# still server-authored: gate it to a conservative identifier shape.
+_MODEL_SURFACE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,63}\Z")
+
+
+def _classify_acp_stop_reason(payload: Any) -> str:
+    raw = (
+        str(payload.get("stopReason") or "").strip()
+        if isinstance(payload, dict)
+        else ""
+    )
+    if not raw:
+        return "unreported"
+    return raw if raw in _ACP_STOP_REASONS else "unrecognized"
+
+
+def _classify_model_surface(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unreported"
+    return text if _MODEL_SURFACE_RE.match(text) else "unrecognized"
+
+
 class AntigravityACPClient:
     """OpenAI-client-compatible facade backed by Google's official ACP process.
 
@@ -3915,18 +3956,34 @@ class AntigravityACPClient:
         self._cancel_epoch = 0
         # Stage tracing (issue #26): None unless explicitly opted in, so the
         # disabled path costs one ``is None`` check per hook. The request key
-        # is an ephemeral salted hash joining this instance's attempts; it is
-        # derived from fresh uuid4 material and is never a global identifier.
+        # is scoped per completion call through ``_TRACE_REQUEST_KEY`` (an
+        # ephemeral salted hash from fresh uuid4 material, never a global
+        # identifier); nothing is keyed to the reusable instance.
         self._trace = get_tracer()
-        self._trace_request_key = (
-            (_opaque_permission_id(uuid.uuid4().hex, "trace-request") or "")
-            if self._trace is not None
-            else ""
+        # attempt_key -> (request_key, child pid) for in-flight sessions;
+        # guarded by _active_process_lock so cancel() (interrupt thread) can
+        # attribute cancel_requested to the exact attempt and join its
+        # request key without touching the request loop.
+        self._trace_inflight: dict[str, tuple[str, int]] = {}
+
+    def _begin_trace_request(self) -> contextvars.Token[str] | None:
+        """Open a per-completion-call trace scope (issue #26 review item 1).
+
+        Returns a reset token when this call opened the scope, or ``None``
+        when tracing is disabled or an enclosing completion call already
+        opened one (corrections and failover replays stay inside the same
+        request key).
+        """
+        if self._trace is None or _TRACE_REQUEST_KEY.get():
+            return None
+        return _TRACE_REQUEST_KEY.set(
+            _opaque_permission_id(uuid.uuid4().hex, "trace-request") or ""
         )
-        # attempt_key -> child pid for in-flight sessions; guarded by
-        # _active_process_lock so cancel() (interrupt thread) can attribute
-        # cancel_requested without touching the request loop.
-        self._trace_inflight: dict[str, int] = {}
+
+    @staticmethod
+    def _end_trace_request(token: contextvars.Token[str] | None) -> None:
+        if token is not None:
+            _TRACE_REQUEST_KEY.reset(token)
 
     def _trace_event(
         self,
@@ -3946,7 +4003,7 @@ class AntigravityACPClient:
             return
         tracer.emit(
             stage=stage,
-            req_key=req_key or self._trace_request_key or "unknown",
+            req_key=req_key or _TRACE_REQUEST_KEY.get() or "unknown",
             pid=pid,
             detail=detail,
         )
@@ -4083,13 +4140,17 @@ class AntigravityACPClient:
         if self._trace is not None:
             # cancel_requested (issue #26) records OUR action only: whether
             # the vendor stopped compute is not observable here and is never
-            # claimed.
-            for _attempt_key, _pid in inflight_trace.items():
+            # claimed. The stored request key joins the cancel (interrupt
+            # thread) back to the completion call that owned the attempt.
+            for _attempt_key, (_req_key, _pid) in inflight_trace.items():
                 self._trace_event(
                     "cancel_requested",
                     req_key=_attempt_key,
                     pid=_pid or None,
-                    detail={"source": "hermes_interrupt"},
+                    detail={
+                        "source": "hermes_interrupt",
+                        "request_key": _req_key or "unknown",
+                    },
                 )
         if len(procs) > 1:
             logger.warning(
@@ -4101,6 +4162,36 @@ class AntigravityACPClient:
             self._terminate_process(proc)
 
     def _create_chat_completion(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        reasoning_effort: Any = None,
+        **_: Any,
+    ) -> Any:
+        # Stage tracing (issue #26, review item 1): one completion call is
+        # one request scope. The key lives in a ContextVar so a reused
+        # instance never merges two calls' events, and nested internals
+        # (corrections, failover replays, the _run_prompt below) reuse it.
+        trace_token = self._begin_trace_request()
+        try:
+            return self._create_chat_completion_traced(
+                model=model,
+                messages=messages,
+                timeout=timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                reasoning_effort=reasoning_effort,
+            )
+        finally:
+            self._end_trace_request(trace_token)
+
+    def _create_chat_completion_traced(
         self,
         *,
         model: str | None = None,
@@ -4785,7 +4876,10 @@ class AntigravityACPClient:
         )
         if trace is not None:
             with self._active_process_lock:
-                self._trace_inflight[attempt_key] = int(proc.pid or 0)
+                self._trace_inflight[attempt_key] = (
+                    _TRACE_REQUEST_KEY.get(),
+                    int(proc.pid or 0),
+                )
         # JSON-RPC ids must stay unique for the lifetime of one stdio
         # connection, so the counter continues across parked sessions.
         id_state = {"last": entry["next_id"] - 1}
@@ -4877,16 +4971,24 @@ class AntigravityACPClient:
                             "requested_model": (
                                 activity_stats.get("requested_model") or "unspecified"
                             ),
-                            "effective_model": (
-                                activity_stats.get("model") or "unreported"
+                            "effective_model": _classify_model_surface(
+                                activity_stats.get("model")
                             ),
                             # Byte count only; prompt text is never recorded.
+                            # UTF-8 encoded bytes, not code points (review
+                            # item 3): the number must match wire cost.
                             "prompt_text_bytes": sum(
-                                len(str(block.get("text") or ""))
+                                len(
+                                    str(block.get("text") or "").encode(
+                                        "utf-8", errors="replace"
+                                    )
+                                )
                                 for block in params.get("prompt") or ()
                                 if isinstance(block, dict)
                             ),
-                            "request_key": self._trace_request_key,
+                            "request_key": (
+                                _TRACE_REQUEST_KEY.get() or "unknown"
+                            ),
                         },
                     )
             except BrokenPipeError:
@@ -5002,14 +5104,9 @@ class AntigravityACPClient:
                         pid=proc.pid,
                         detail={
                             "outcome": "completed",
-                            "stop_reason": (
-                                str(
-                                    prompt_result_payload.get("stopReason") or ""
-                                ).strip()
-                                if isinstance(prompt_result_payload, dict)
-                                else ""
-                            )
-                            or "unreported",
+                            "stop_reason": _classify_acp_stop_reason(
+                                prompt_result_payload
+                            ),
                             "elapsed_ms": int(
                                 (time.monotonic() - prompt_sent_at) * 1000
                             ),
@@ -5081,7 +5178,7 @@ class AntigravityACPClient:
                         "elapsed_ms": int(
                             (time.monotonic() - initialize_started) * 1000
                         ),
-                        "request_key": self._trace_request_key,
+                        "request_key": _TRACE_REQUEST_KEY.get() or "unknown",
                     },
                 )
                 # Pin the server's consumption semantics for the lifetime of
@@ -5152,7 +5249,7 @@ class AntigravityACPClient:
                         "session_id_hash": _opaque_permission_id(
                             session.get("sessionId"), "session"
                         ),
-                        "request_key": self._trace_request_key,
+                        "request_key": _TRACE_REQUEST_KEY.get() or "unknown",
                     },
                 )
             yield session, request, activity_stats
@@ -5377,7 +5474,46 @@ class AntigravityACPClient:
         and a response reported under a different session id than pinned is
         rejected. Used only by malformed tool-call regeneration; the ordinary
         conversation transport policy is untouched.
+
+        Stage tracing (issue #26, review item 1): opens a request scope when
+        entered directly (e.g. as the completion entry in tests); inside a
+        completion call it reuses the enclosing request key.
         """
+        trace_token = self._begin_trace_request()
+        try:
+            return self._run_prompt_traced(
+                prompt_text,
+                timeout_seconds=timeout_seconds,
+                model=model,
+                affinity_key=affinity_key,
+                resume_session_id=resume_session_id,
+                full_prompt_text=full_prompt_text,
+                session_result=session_result,
+                native_token_hint=native_token_hint,
+                image_blocks=image_blocks,
+                replay_image_blocks=replay_image_blocks,
+                thinking_level=thinking_level,
+                strict_same_session=strict_same_session,
+            )
+        finally:
+            self._end_trace_request(trace_token)
+
+    def _run_prompt_traced(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+        affinity_key: str = "",
+        resume_session_id: str = "",
+        full_prompt_text: str | None = None,
+        session_result: dict[str, Any] | None = None,
+        native_token_hint: int = 0,
+        image_blocks: tuple[dict[str, str], ...] = (),
+        replay_image_blocks: tuple[dict[str, str], ...] = (),
+        thinking_level: str | None = None,
+        strict_same_session: bool = False,
+    ) -> tuple[str, str]:
         deadline = time.monotonic() + timeout_seconds
         replay_text = full_prompt_text or prompt_text
         next_text = prompt_text

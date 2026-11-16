@@ -39,16 +39,23 @@ Plugin trace — one JSONL line per event:
   `response_rejected`, `retry_attempt`, `unknown` (plugin file) and
   `lane_bound`, `process_exit` (mux file).
 * `req_key` — ephemeral salted hash. Per-attempt keys join the lifecycle
-  stages of one ACP session attempt; `detail.request_key` (per client
-  instance = per Core request) joins the attempts of one logical request
-  (corrections, replays, failovers). Keys derive from fresh `uuid4` material:
+  stages of one ACP session attempt; `detail.request_key` (one per
+  completion call, held in a request-scoped ContextVar — never per client
+  instance) joins the attempts and events of one logical request
+  (corrections, replays, failovers, and the `cancel_requested` emitted from
+  the interrupt thread). A reused client instance therefore never merges
+  two calls' events. Keys derive from fresh `uuid4` material:
   never a stable global identifier.
 * `pid` — the plugin's direct child pid (the mux pid in mux deployments).
-* `detail` — bounded classification only: elapsed ms, byte counts, protocol
-  method names, `stopReason`, exit codes, requested-vs-effective model ids
-  (surface names, never sensitive), salted hashes, classification enums,
-  explicit `unknown`. Structured values are redacted at the emit boundary;
-  strings are truncated.
+* `detail` — bounded classification only: elapsed ms, byte counts (UTF-8
+  encoded, e.g. `prompt_text_bytes`), protocol method names, exit codes,
+  requested-vs-effective model ids (server-authored values are gated to an
+  identifier shape; anything else records `unrecognized`), `stop_reason`
+  restricted to the ACP spec enum (`end_turn`, `max_tokens`,
+  `max_turn_requests`, `refusal`, `cancelled`) with any other server string
+  recorded as `unrecognized` — never verbatim, salted hashes,
+  classification enums, explicit `unknown`. Structured values are redacted
+  at the emit boundary; strings are truncated.
 
 Mux trace — flat records: `{t_mono, stage, mux_pid, child_pid, lane, reason}`
 for `lane_bound` and `{t_mono, stage, mux_pid, child_pid, exit_code}` for
