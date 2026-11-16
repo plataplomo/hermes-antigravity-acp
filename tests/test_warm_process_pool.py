@@ -13,7 +13,13 @@ same stdio connection.  These tests pin the warm-pool contract:
 
 from __future__ import annotations
 
+import array
 import importlib.util
+import json
+import os
+import select
+import signal
+import socket
 import sys
 import time
 from pathlib import Path
@@ -218,3 +224,134 @@ def test_shutdown_terminates_parked_children(fake, tmp_path) -> None:
     while any(p.poll() is None for p in procs) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert all(p.poll() is not None for p in procs)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux proc start-time identities and fork")
+@pytest.mark.parametrize("hold_stdin_open", [False, True])
+def test_parked_fixture_natural_exit_after_owner_hard_exit(fake, tmp_path, hold_stdin_open) -> None:
+    """Observe the real fixture and grandchild without signals; retain a writer as a negative control."""
+    from scripts.gateway_e2e import _live
+
+    module, _, _ = fake
+    fixture = PLUGIN_DIR.parent.parent / "scripts" / "gateway_fake_acp.py"
+    events_file = tmp_path / "acp-events.jsonl"
+    (tmp_path / "control.json").write_text(json.dumps({"mode": "reply", "text": "synthetic"}))
+    parent, child = socket.socketpair()
+    parent.settimeout(15)
+    owner = os.fork()
+    if owner == 0:
+        parent.close()
+        try:
+            client = module.AntigravityACPClient(acp_command=sys.executable,
+                acp_args=[str(fixture), str(tmp_path)], acp_cwd=str(tmp_path))
+            with client._session(10.0):
+                pass
+            parked = [entry["proc"] for entries in module._warm_pool.values() for entry in entries]
+            if len(parked) != 1 or parked[0].stdin is None or parked[0].poll() is not None:
+                child.sendall(b"F")
+                os._exit(1)
+            rights = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                       array.array("i", [parked[0].stdin.fileno()]))] if hold_stdin_open else []
+            child.sendmsg([b"R"], rights)
+            if child.recv(1) != b"G":
+                os._exit(2)
+            os._exit(0)  # Same hard-exit primitive as Core; skips the provider's atexit hook.
+        except BaseException:
+            try:
+                module._shutdown_warm_pool()
+            finally:
+                try:
+                    child.sendall(b"F")
+                finally:
+                    os._exit(3)
+
+    child.close()
+    held_fd = None
+    owner_reaped = False
+    identities = []
+    try:
+        message, ancillary, flags, _ = parent.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
+        assert message == b"R" and not flags & socket.MSG_CTRUNC
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                received = array.array("i")
+                received.frombytes(data[:len(data) - len(data) % received.itemsize])
+                assert len(received) == 1
+                held_fd = received[0]
+        assert (held_fd is not None) == hold_stdin_open
+        events = [json.loads(line) for line in events_file.read_text().splitlines()]
+        started = [event for event in events if event.get("event") == "server_started"]
+        assert len(started) == 1
+        event = started[0]
+        identities = [(event["pid"], event["started"]), (event["grandchild_pid"], event["grandchild_started"])]
+        assert all(_live(pid, token) for pid, token in identities)
+        parent.sendall(b"G")
+        owner_pidfd = os.pidfd_open(owner)
+        try:
+            assert select.select([owner_pidfd], [], [], 5)[0], "fixture owner did not exit within the bound"
+            waited, status = os.waitpid(owner, 0)
+            owner_reaped = True
+            assert waited == owner and os.waitstatus_to_exitcode(status) == 0
+        finally:
+            os.close(owner_pidfd)
+        initial_alive = tuple(_live(pid, token) for pid, token in identities)
+        if hold_stdin_open:
+            assert held_fd is not None
+            # No signal is sent; keeping a genuine pipe writer open prevents stdin EOF.
+            time.sleep(0.3)
+            assert all(_live(pid, token) for pid, token in identities)
+            assert not any(json.loads(line).get("event") == "server_exited"
+                           for line in events_file.read_text().splitlines())
+            os.close(held_fd)
+            held_fd = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            events = [json.loads(line) for line in events_file.read_text().splitlines()]
+            if (any(event.get("event") == "server_exited" for event in events)
+                    and not any(_live(pid, token) for pid, token in identities)):
+                break
+            time.sleep(0.01)
+        assert any(event.get("event") == "server_exited" for event in events)
+        assert not _live(*identities[0]), "fixture did not exit naturally"
+        assert not _live(*identities[1]), "fixture grandchild did not exit naturally"
+        print(f"fixture_observation held_writer={hold_stdin_open} "
+              f"initial_fixture_alive={initial_alive[0]} initial_grandchild_alive={initial_alive[1]} "
+              "server_exited=True final_fixture_alive=False final_grandchild_alive=False observer_signals_sent=False")
+    finally:
+        if held_fd is not None:
+            os.close(held_fd)
+        parent.close()
+        if not owner_reaped:
+            try:
+                waited, _ = os.waitpid(owner, os.WNOHANG)
+                if not waited:
+                    os.kill(owner, signal.SIGKILL)
+                    os.waitpid(owner, 0)
+            except ChildProcessError:
+                pass
+        # Only fixture-recorded identities; an observation timeout never becomes PASS.
+        if not identities and events_file.exists():
+            for line in events_file.read_text().splitlines():
+                event = json.loads(line)
+                if event.get("event") == "server_started":
+                    identities.extend([(event["pid"], event["started"]),
+                                       (event["grandchild_pid"], event["grandchild_started"])])
+        for pid, token in identities:
+            if _live(pid, token):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 2
+        while any(_live(pid, token) for pid, token in identities) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        for pid, token in identities:
+            if _live(pid, token):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 2
+        while any(_live(pid, token) for pid, token in identities) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not any(_live(pid, token) for pid, token in identities), "fixture cleanup left a live process"
