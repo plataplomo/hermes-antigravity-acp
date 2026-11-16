@@ -256,8 +256,11 @@ def run_gateway(policy: dict, boundary: dict, work: Path = Path("/gw")) -> int:
         from gateway_e2e import main as gateway_main, validate_receipt
     except ImportError:
         from scripts.gateway_e2e import main as gateway_main, validate_receipt
-    result = gateway_main(["--hermes-root", policy["core"], "--candidate-sha", policy["candidate"],
-                           "--output", str(work / "verification.json")])
+    args = ["--hermes-root", policy["core"], "--candidate-sha", policy["candidate"],
+            "--output", str(work / "verification.json")]
+    if policy.get("inject_held_fault") is True:
+        args.append("--inject-held-fault")
+    result = gateway_main(args)
     record = json.loads((work / "verification.json").read_text())
     record.update(docker_contract_version=2, checkout_sha=policy["candidate"])
     record["confinement"] = proof
@@ -381,6 +384,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hermes-root", type=Path)
     parser.add_argument("--candidate-sha")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--inject-held-fault", action="store_true")
     args = parser.parse_args(argv)
     if args.inside:
         return inside()
@@ -422,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         policy = {"uid": os.getuid(), "gid": os.getgid(), "repo": str(repo), "core": str(core),
                   "candidate": args.candidate_sha, "host_pid_ns": os.readlink("/proc/self/ns/pid"),
                   "host_net_ns": os.readlink("/proc/self/ns/net"), "outside_pid": os.getpid(),
-                  "outside_file": str(root / "outside-canary")}
+                  "outside_file": str(root / "outside-canary"), "inject_held_fault": args.inject_held_fault}
         policy_file = root / "policy.json"
         policy_file.write_text(json.dumps(policy))
         mounts = mounts_for(repo, core)
