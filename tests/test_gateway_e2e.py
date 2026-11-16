@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from scripts.gateway_docker import CHECKS
@@ -225,10 +226,12 @@ class GatewayCleanupObservationTests(unittest.TestCase):
                 if trigger == "fixture":
                     live.side_effect = [True, False, False, False, False, False, False, False]
                 with patch.object(gateway, "_live", live), patch.object(gateway.os, "kill"), \
+                     patch.object(gateway, "fixture_shutdown_state", return_value=(
+                         [(91111, "secret-start"), (92222, "secret-child")], [])), \
                      patch.object(gateway.os, "killpg"):
                     run.cleanup()
-                self.assertEqual({"forced_reasons": [expected], "owner_exit": "zero"},
-                                 run.record["cleanup_diagnostics"])
+                self.assertEqual([expected], run.record["cleanup_diagnostics"]["forced_reasons"])
+                self.assertEqual("zero", run.record["cleanup_diagnostics"]["owner_exit"])
                 self.assertEqual(0, run.record["live_owned_children_after_exit"])
                 self.assertEqual("PASS", run.record["shutdown_diagnostic"]["status"])
                 self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
@@ -245,11 +248,146 @@ class GatewayCleanupObservationTests(unittest.TestCase):
                 run.process = Mock(returncode=returncode)
                 run.process.poll.return_value = 0
                 run.cleanup()
-                self.assertEqual({"forced_reasons": [], "owner_exit": expected}, run.record["cleanup_diagnostics"])
+                self.assertEqual([], run.record["cleanup_diagnostics"]["forced_reasons"])
+                self.assertEqual(expected, run.record["cleanup_diagnostics"]["owner_exit"])
+                self.assertEqual("not_observed", run.record["cleanup_diagnostics"]["fixture_exit"]["status"])
         with tempfile.TemporaryDirectory() as temp:
             run = self.run_object(Path(temp))
             run.cleanup()
             self.assertEqual("unknown", run.record["cleanup_diagnostics"]["owner_exit"])
+
+    def test_fixture_event_matching_fails_closed_on_missing_or_reused_pid(self):
+        start = {"event": "server_started", "pid": 100, "started": "old", "grandchild_pid": 101,
+                 "grandchild_started": "child-old"}
+        newer = {"event": "server_started", "pid": 100, "started": "new", "grandchild_pid": 102,
+                 "grandchild_started": "child-new"}
+        with patch.object(gateway, "_live", return_value=False):
+            _, unmet = gateway.fixture_shutdown_state([start, {"event": "server_exited", "pid": 100}, newer])
+            self.assertEqual(["server_exited_missing"], unmet)
+            _, unmet = gateway.fixture_shutdown_state(
+                [start, {"event": "server_exited", "pid": 100}, newer, {"event": "server_exited", "pid": 100}])
+            self.assertEqual([], unmet)
+
+    def test_fixture_missing_event_or_live_grandchild_times_out_and_fails(self):
+        start = {"event": "server_started", "pid": 91111, "started": "start-token",
+                 "grandchild_pid": 92222, "grandchild_started": "child-token"}
+        for scenario in ("missing_event", "grandchild_alive"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                run = self.run_object(root)
+                run.process = Mock(returncode=0)
+                run.process.poll.return_value = 0
+                events = [start] + ([{"event": "server_exited", "pid": 91111}]
+                                    if scenario == "grandchild_alive" else [])
+                run.events = Mock(return_value=events)
+                logs = run.home / "logs"
+                logs.mkdir(parents=True)
+                (logs / "gateway-shutdown-diag.log").write_text("=== end ===")
+                (root / "gateway-envelope.json").write_text(json.dumps(
+                    {"refusals": [], "housekeeping": [{"kind": "shutdown"}]}))
+                alive = {92222} if scenario == "grandchild_alive" else set()
+                def live(pid, token):
+                    return pid in alive
+                def terminate(pid, sig):
+                    alive.discard(pid)
+                ticks = iter([0.0, 5.0, 5.0])
+                def clock():
+                    return next(ticks, 5.0)
+                with patch.object(gateway, "_live", side_effect=live), \
+                     patch.object(gateway.time, "monotonic", side_effect=clock), \
+                     patch.object(gateway.os, "kill", side_effect=terminate):
+                    run.cleanup()
+                diag = run.record["cleanup_diagnostics"]["fixture_exit"]
+                self.assertEqual("timeout", diag["status"])
+                self.assertEqual(5.0, diag["elapsed_seconds"])
+                self.assertEqual(["server_exited_missing"] if scenario == "missing_event" else ["grandchild_alive"],
+                                 diag["unmet"])
+                self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+                if scenario == "grandchild_alive":
+                    self.assertEqual(["fixture_child_alive"], run.record["cleanup_diagnostics"]["forced_reasons"])
+                else:
+                    self.assertEqual([], run.record["cleanup_diagnostics"]["forced_reasons"])
+                encoded = json.dumps(run.record["cleanup_diagnostics"])
+                for secret in ("91111", "92222", "start-token", "child-token", str(root)):
+                    self.assertNotIn(secret, encoded)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires proc start-time identity")
+    def test_real_fixture_eof_is_synchronized_without_force(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = Path(__file__).resolve().parent.parent / "scripts" / "gateway_fake_acp.py"
+            (root / "control.json").write_text('{"mode":"reply","text":"synthetic"}')
+            process = subprocess.Popen([sys.executable, str(fixture), str(root)], stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                event_path = root / "acp-events.jsonl"
+                while not event_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(event_path.exists())
+                run = self.run_object(root)
+                run.process = Mock(returncode=0)
+                stdin = process.stdin
+                assert stdin is not None
+                def close_stdin():
+                    stdin.close()
+                    return 0
+                run.process.poll.side_effect = close_stdin
+                logs = run.home / "logs"
+                logs.mkdir(parents=True)
+                (logs / "gateway-shutdown-diag.log").write_text("=== end ===")
+                (root / "gateway-envelope.json").write_text(json.dumps(
+                    {"refusals": [], "housekeeping": [{"kind": "shutdown"}]}))
+                with patch.object(gateway.os, "kill", wraps=gateway.os.kill) as kill:
+                    run.cleanup()
+                kill.assert_not_called()
+                diag = run.record["cleanup_diagnostics"]
+                self.assertEqual("complete", diag["fixture_exit"]["status"])
+                self.assertEqual([], diag["fixture_exit"]["unmet"])
+                self.assertEqual([], diag["forced_reasons"])
+                self.assertEqual("PASS", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("PASS", run.record["stages"]["child_cleanup"]["status"])
+            finally:
+                if process.stdin and not process.stdin.closed:
+                    process.stdin.close()
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires proc start-time identity")
+    def test_real_open_stdin_fixture_times_out_then_forces_fail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = Path(__file__).resolve().parent.parent / "scripts" / "gateway_fake_acp.py"
+            (root / "control.json").write_text('{"mode":"reply","text":"synthetic"}')
+            process = subprocess.Popen([sys.executable, str(fixture), str(root)], stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                event_path = root / "acp-events.jsonl"
+                while not event_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(event_path.exists())
+                run = self.run_object(root)
+                run.process = Mock(returncode=0)
+                run.process.poll.return_value = 0
+                run.cleanup()
+                diag = run.record["cleanup_diagnostics"]
+                self.assertEqual("timeout", diag["fixture_exit"]["status"])
+                self.assertGreaterEqual(diag["fixture_exit"]["elapsed_seconds"], 5.0)
+                self.assertEqual({"fixture_alive", "grandchild_alive", "server_exited_missing"},
+                                 set(diag["fixture_exit"]["unmet"]))
+                self.assertEqual(["fixture_child_alive"], diag["forced_reasons"])
+                self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+                self.assertEqual(0, run.record["live_owned_children_after_exit"])
+            finally:
+                if process.stdin:
+                    process.stdin.close()
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
 
     def test_empty_owned_child_set_never_marks_child_cleanup_success(self):
         with tempfile.TemporaryDirectory() as temp:

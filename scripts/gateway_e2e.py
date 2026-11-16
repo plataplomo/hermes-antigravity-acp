@@ -189,6 +189,29 @@ def _live(pid: int, started: str | None = None) -> bool:
         return False
 
 
+def fixture_shutdown_state(events: list[dict]) -> tuple[list[tuple[int, str]], list[str]]:
+    """Match each exit to its most recent start; report only fixed missing-state tokens."""
+    latest: dict[int, tuple[int, str]] = {}
+    started: list[tuple[tuple[int, str], tuple[int, str]]] = []
+    exited: set[tuple[int, str]] = set()
+    for event in events:
+        if event.get("event") == "server_started":
+            fixture = (event["pid"], event["started"])
+            grandchild = (event["grandchild_pid"], event["grandchild_started"])
+            latest[fixture[0]] = fixture
+            started.append((fixture, grandchild))
+        elif event.get("event") == "server_exited" and event.get("pid") in latest:
+            exited.add(latest[event["pid"]])
+    unmet: list[str] = []
+    if any(fixture not in exited for fixture, _ in started):
+        unmet.append("server_exited_missing")
+    if any(_live(*fixture) for fixture, _ in started):
+        unmet.append("fixture_alive")
+    if any(_live(*grandchild) for _, grandchild in started):
+        unmet.append("grandchild_alive")
+    return [identity for pair in started for identity in pair], unmet
+
+
 class GatewayFailure(RuntimeError):
     pass
 
@@ -504,6 +527,15 @@ class Run:
                     forced_reasons.add("contender_sigint_timeout" if role == "contender" else "owner_sigint_timeout")
                     os.killpg(process.pid, signal.SIGKILL)  # only our Popen session, never a host scan
                     process.wait(timeout=5)
+        fixture_wait_started = time.monotonic()
+        fixture_deadline = fixture_wait_started + 5
+        while True:
+            fixture_ids, fixture_unmet = fixture_shutdown_state(self.events())
+            now = time.monotonic()
+            if not fixture_unmet or now >= fixture_deadline:
+                break
+            time.sleep(min(0.05, fixture_deadline - now))
+        fixture_elapsed = round(time.monotonic() - fixture_wait_started, 3)
         for event in self.events():
             if event.get("event") == "server_started":
                 for key in ("pid", "grandchild_pid"):
@@ -562,14 +594,18 @@ class Run:
         returncode = self.process.returncode if self.process is not None else None
         exit_class = ("unknown" if type(returncode) is not int else
                       "zero" if returncode == 0 else "signal" if returncode < 0 else "nonzero")
-        self.record["cleanup_diagnostics"] = {"forced_reasons": sorted(forced_reasons), "owner_exit": exit_class}
+        self.record["cleanup_diagnostics"] = {
+            "forced_reasons": sorted(forced_reasons), "owner_exit": exit_class,
+            "fixture_exit": {"status": "not_observed" if not fixture_ids else "timeout" if fixture_unmet else "complete",
+                             "elapsed_seconds": fixture_elapsed, "unmet": fixture_unmet}}
         if self.process is not None:
-            success = self.process.returncode == 0 and not forced and diagnostic_ok
+            success = self.process.returncode == 0 and not forced and diagnostic_ok and not fixture_unmet
             self.record["stages"]["shutdown"] = {"status": "PASS" if success else "FAIL", "detail": "graceful_exit_and_original_diagnostic" if success else "unclean_exit_or_missing_diagnostic"}
         self.record["stages"]["child_cleanup"] = {
-            "status": "PASS" if clean and not forced else "FAIL",
-            "detail": ("no_live_owned_children" if clean and not forced
+            "status": "PASS" if clean and not forced and not fixture_unmet else "FAIL",
+            "detail": ("no_live_owned_children" if clean and not forced and not fixture_unmet
                        else "no_owned_child_process_evidence" if not pids
+                       else "fixture_shutdown_unverified" if fixture_unmet and not forced
                        else "residual_or_forced_cleanup")}
 
 
