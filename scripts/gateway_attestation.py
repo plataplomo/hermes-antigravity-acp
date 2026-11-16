@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 try:
@@ -15,7 +16,20 @@ except ImportError:
     from scripts.gateway_docker import validate_docker_receipt
 
 
-def check_outputs(outputs: dict, *, required: bool, candidate: str | None = None) -> list[str]:
+def stable_baseline() -> dict[str, str]:
+    """Load the exact official source and image identity; malformed policy fails closed."""
+    policy = json.loads((Path(__file__).resolve().parent.parent / "release/hermes-core-baseline.json").read_text())
+    if (not isinstance(policy, dict) or set(policy) != {"tag", "commit", "docker_image"}
+            or not isinstance(policy["tag"], str) or not re.fullmatch(r"v\d+\.\d+\.\d+", policy["tag"])
+            or not isinstance(policy["commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", policy["commit"])
+            or not isinstance(policy["docker_image"], str)
+            or not re.fullmatch(r"docker\.io/nousresearch/hermes-agent@sha256:[0-9a-f]{64}", policy["docker_image"])):
+        raise ValueError("stable_core_baseline_invalid")
+    return policy
+
+
+def check_outputs(outputs: dict, *, required: bool, candidate: str | None = None,
+                  stable: bool = False) -> list[str]:
     if not isinstance(outputs, dict):
         return ["gateway_outputs_malformed"]
     outcome = outputs.get("gateway_result")
@@ -37,6 +51,8 @@ def check_outputs(outputs: dict, *, required: bool, candidate: str | None = None
         problems.append("gateway_checkout_identity_mismatch")
     if not isinstance(outputs.get("gateway_core"), str) or record.get("hermes_commit") != outputs["gateway_core"]:
         problems.append("gateway_core_identity_mismatch")
+    if stable and outputs.get("gateway_core") != stable_baseline()["commit"]:
+        problems.append("gateway_core_not_stable_baseline")
     return problems
 
 

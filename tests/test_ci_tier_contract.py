@@ -430,8 +430,8 @@ def _gateway_outputs(candidate="a" * 40):
     from scripts.gateway_e2e import REQUIRED_STAGES
     from scripts.gateway_docker import CHECKS
     # Synthetic UNIT input, never an execution receipt.
-    return {"attested_sha": candidate, "gateway_core": "b" * 40, "gateway_result": "success", "gateway_record": json.dumps({
-        "schema_version": 2, "candidate_sha": candidate, "hermes_commit": "b" * 40, "status": "PASS",
+    return {"attested_sha": candidate, "gateway_core": "3b421578588243f920886e6fe79a6faa87ea026e", "gateway_result": "success", "gateway_record": json.dumps({
+        "schema_version": 2, "candidate_sha": candidate, "hermes_commit": "3b421578588243f920886e6fe79a6faa87ea026e", "status": "PASS",
         "boundary_refusal_reasons": [],
         "owned_child_count": 2, "live_owned_children_after_exit": 0,
         "candidate_source_dirty": False,
@@ -719,6 +719,8 @@ def test_docs_only_diff_in_a_real_repo_stays_fast(tmp_path) -> None:
 # dispatch. They are deliberately not tier lanes and are never wired into
 # `CI gate`; the release-gate sync test below owns their needs list.
 RELEASE_ONLY_JOBS = {"candidate-identity", "release-gate"}
+# The user-approved moving-main diagnostic is visible but does not gate stable CI.
+ADVISORY_JOBS = {"latest-main-compat"}
 
 
 def _top_level_job_ids(ci: str) -> set[str]:
@@ -737,11 +739,12 @@ def test_gate_needs_stay_in_sync_with_the_workflow_jobs(ci: str) -> None:
     jobs = _top_level_job_ids(ci)
     assert "ci-gate" in jobs, "workflow job discovery is broken"
     needs = _gate_needs(ci)
-    missing = jobs - {"ci-gate"} - RELEASE_ONLY_JOBS - needs
+    missing = jobs - {"ci-gate"} - RELEASE_ONLY_JOBS - ADVISORY_JOBS - needs
     stale = needs - jobs
+    assert not (needs & ADVISORY_JOBS)
     assert not missing, f"jobs missing from ci-gate needs: {sorted(missing)}"
     assert not stale, f"ci-gate needs reference unknown jobs: {sorted(stale)}"
-    assert set(ALL_LANES) == jobs - {"ci-gate"} - RELEASE_ONLY_JOBS, (
+    assert set(ALL_LANES) == jobs - {"ci-gate"} - RELEASE_ONLY_JOBS - ADVISORY_JOBS, (
         "ALL_LANES drifted from the workflow; sync the contract test"
     )
 

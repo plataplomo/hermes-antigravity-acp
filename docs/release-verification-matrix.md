@@ -107,8 +107,14 @@ success or inference. Windows selection/factory remains unverified because
 the real-Core probe assumes POSIX UID/launcher semantics. macOS and Linux
 ARM now have real-Core registration/factory evidence, but not dedicated-UID
 isolation. No lane claims live-account validation or authenticated inference.
-Latest upstream Hermes `main` and minimum `v0.21.6` strict seams remain
-required; the native probe's reviewed Core commit pin is preserved.
+The mandatory Hermes release lanes are the stable official baseline
+**v0.23.1** (source commit `3b421578588243f920886e6fe79a6faa87ea026e`, official unsigned annotated tag
+`v0.23.1`, Docker Hub image index digest `sha256:276d44685c65c0cb2a25f190b63c65c8906f9dc76486fb1c05ae71b5826bda08` — provenance metadata only,
+not evidence CI ran the official image; no hosted v0.23.1 PASS is claimed) and
+the minimum `v0.21.6` strict seam; the latest-`main` seam is a separate
+advisory diagnostic that may fail without blocking and is not compatibility
+evidence (2026-11-16 policy, [hermes-compatibility.md](hermes-compatibility.md)).
+The native probe's reviewed Core commit pin is preserved.
 
 ## Tests, cost and the subsequent main-push change
 
@@ -133,6 +139,7 @@ the separate Phase A follow-up changes `ci_change_scope.py::scope_for_event`'s p
 workflow/contract tests: routine main push = Fast + risk-required OS;
 packaging/architecture = affected full native coverage; unknown/detection
 failure = full coverage; release dispatch = all five exact-SHA targets.
-That follow-up must retain publisher checks, Windows ARM installation,
-latest/minimum strict seams, pytest discovery, #31 regressions and both
-fail-closed gates, then measure the resulting ordinary-main savings.
+Under its then-current policy that follow-up retained publisher checks, Windows
+ARM installation, latest/minimum strict seams, pytest discovery, #31 regressions
+and both fail-closed gates. The newer stable/main policy above supersedes only
+the latest-main gating obligation.

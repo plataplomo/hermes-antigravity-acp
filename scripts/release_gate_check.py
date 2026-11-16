@@ -154,7 +154,7 @@ def evaluate(
             )
 
     gateway_outputs = (results.get("upstream-hermes-compat") or {}).get("outputs") or {}
-    for problem in check_gateway_outputs(gateway_outputs, required=True, candidate=candidate):
+    for problem in check_gateway_outputs(gateway_outputs, required=True, candidate=candidate, stable=True):
         fail("gateway_e2e: " + problem)
 
     for entry in matrix.cells():

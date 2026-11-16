@@ -133,7 +133,7 @@ def evaluate(expected: dict[str, object], results: dict[str, dict]) -> tuple[boo
         check(lane, expected_arm, "arm")
 
     gateway_outputs = (results.get("upstream-hermes-compat") or {}).get("outputs") or {}
-    for problem in check_gateway_outputs(gateway_outputs, required=expected_os):
+    for problem in check_gateway_outputs(gateway_outputs, required=True, stable=True):
         ok = False
         lines.append("FAIL gateway_e2e: " + problem)
 
