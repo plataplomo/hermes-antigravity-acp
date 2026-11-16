@@ -10,6 +10,7 @@ alone must never classify a child as verified scratch/shutdown work.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -30,6 +31,55 @@ def _load():
 
 
 envelope, PRUNE_BODY = _load()
+
+
+class AuditMkdirTests(unittest.TestCase):
+    @unittest.skipUnless(os.mkdir in os.supports_dir_fd, "mkdir dir_fd is unavailable")
+    def test_mkdir_dir_fd_is_refused_but_normal_root_mkdir_succeeds(self):
+        # Install the actual nested audit/reject/path functions in a child process:
+        # CPython audit hooks are permanent, so they must not contaminate pytest.
+        script = r'''
+import ast, json, os, sys, traceback
+from pathlib import Path
+root, outside, source = (Path(value) for value in sys.argv[1:])
+tree = ast.parse(source.read_text())
+main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+funcs = {node.name: node for node in main.body if isinstance(node, ast.FunctionDef)}
+namespace = {"Path": Path, "os": os, "sys": sys, "traceback": traceback, "json": json,
+             "root": root, "core": root, "allowed": [root], "protected": [],
+             "confined": True, "refused": []}
+module = ast.fix_missing_locations(ast.Module(body=[funcs[name] for name in ("path_of", "reject", "audit")], type_ignores=[]))
+exec(compile(module, str(source), "exec"), namespace)
+inside_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+outside_fd = os.open(outside, os.O_RDONLY | os.O_DIRECTORY)
+os.chdir(root)
+sys.addaudithook(namespace["audit"])
+os.mkdir("normal")
+os.mkdir(root / "normal-absolute", dir_fd=None)
+assert (root / "normal").is_dir() and (root / "normal-absolute").is_dir()
+for name, fd in (("escape", outside_fd), ("inside-fd", inside_fd)):
+    try:
+        os.mkdir(name, dir_fd=fd)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("mkdir with dir_fd was allowed")
+assert not (outside / "escape").exists()
+assert not (root / "inside-fd").exists()
+assert namespace["refused"] == ["mutation_outside_disposable_root"] * 2
+assert [json.loads(line)["reason"] for line in (root / "audit-refusals.jsonl").read_text().splitlines()] == namespace["refused"]
+os.close(inside_fd)
+os.close(outside_fd)
+'''
+        with tempfile.TemporaryDirectory(prefix="gw-mkdir-audit-") as tmp:
+            parent = Path(tmp).resolve()
+            root, outside = parent / "root", parent / "outside"
+            root.mkdir()
+            outside.mkdir()
+            result = subprocess.run([sys.executable, "-c", script, str(root), str(outside),
+                                     str(SCRIPTS / "gateway_cli_envelope.py")],
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(0, result.returncode, result.stderr)
 
 
 class _FakePopen:
