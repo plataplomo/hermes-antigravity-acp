@@ -165,7 +165,12 @@ def main() -> None:
                 if launch[2]:
                     diagnostic = ("systemctl_block_" + launch[2], diagnostic[1], diagnostic[2])
                 event["diagnostic"] = diagnostic
-            stream.write(json.dumps(event) + "\n")
+                stream.write(json.dumps(event) + "\n")
+                for category in sorted(launch[3]):
+                    stream.write(json.dumps({"reason": reason,
+                                             "diagnostic": (category, diagnostic[1], diagnostic[2])}) + "\n")
+            else:
+                stream.write(json.dumps(event) + "\n")
         raise PermissionError("disposable_gateway_boundary")
 
     def audit(event: str, args: tuple) -> None:
@@ -221,12 +226,15 @@ def main() -> None:
             if not isinstance(command, (list, tuple)) or not command:
                 reject_launch("unapproved_subprocess")
             name = Path(os.fsdecode(command[0])).name
-            systemctl_reason = (systemctl_status_reason(args[0], command, args[2], args[3], root, confined)
+            systemctl_diagnostics: set[str] = set()
+            systemctl_reason = (systemctl_status_reason(args[0], command, args[2], args[3], root, confined,
+                                                        diagnostics=systemctl_diagnostics)
                                 if name == "systemctl" else "")
             systemctl_status = name == "systemctl" and not systemctl_reason
             if str(args[0]) != str(command[0]) or str(command[0]) != sys.executable and name != "git":
                 if PRUNE_BODY not in command and name not in {"timeout", "gtimeout"} and not systemctl_status:
-                    reject_launch("subprocess_executable_mismatch", (args[0], command, systemctl_reason))
+                    reject_launch("subprocess_executable_mismatch", (args[0], command, systemctl_reason,
+                                                                     systemctl_diagnostics))
             is_fixture = len(command) >= 3 and Path(str(command[1])).resolve() == root / "fake-acp.py" and str(command[2]) == str(root)
             # argv shape alone cannot make a git child read-only: the binary PATH resolves,
             # the repository the launch cwd selects, and the configuration the child inherits

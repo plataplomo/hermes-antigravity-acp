@@ -14,6 +14,18 @@ import stat
 from pathlib import Path
 from typing import Sequence
 
+# Source-reviewed Core startup mutations at 5e9c0cd. Identifiers carry no
+# environment names or values. This map is diagnostic, never an admission list.
+SYSTEMCTL_ENV_IDS = {
+    "AI_AGENT": "a", "HERMES_AGENT": "b", "PYTHONUTF8": "c", "PYTHONIOENCODING": "d",
+    "NO_COLOR": "e", "_HERMES_GATEWAY": "f", "HERMES_QUIET": "g", "HERMES_TURN_LEASE_TIMEOUT": "h",
+    "XDG_RUNTIME_DIR": "i", "HERMES_HOME": "j", "HERMES_REDACT_SECRETS": "k",
+    "HERMES_MAX_ITERATIONS": "l", "TERMINAL_ENV": "m", "MALLOC_ARENA_MAX": "n",
+}
+SYSTEMCTL_ENV_TOKENS = frozenset(
+    f"env_{identifier}_{change}" for identifier in SYSTEMCTL_ENV_IDS.values() for change in ("add", "change", "delete")
+) | {"env_unknown"}
+
 # Only these literal tokens may leave the disposable runner as refusal diagnostics.
 DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "uname", "which", "ps", "rg",
                                     "timeout", "gtimeout", "lsof", "hostname", "stty", "tty", "systemctl",
@@ -22,7 +34,7 @@ DIAGNOSTIC_EXECUTABLES = frozenset({"python", "git", "sh", "bash", "dash", "unam
                                     "systemctl_block_path", "systemctl_block_env", "systemctl_block_env_core_markers",
                                     "systemctl_block_env_unsafe",
                                     "systemctl_block_cwd", "systemctl_block_runtime", "systemctl_block_bus",
-                                    "systemctl_block_binary", "systemctl_block_error", "other"})
+                                    "systemctl_block_binary", "systemctl_block_error", "other"}) | SYSTEMCTL_ENV_TOKENS
 DIAGNOSTIC_MISMATCHES = frozenset({"executable_argv0", "unapproved_executable", "both"})
 DIAGNOSTIC_CORE_FILES = {
     "gateway/run.py": "gateway_run", "gateway/run_shutdown.py": "gateway_run_shutdown",
@@ -523,7 +535,8 @@ def _trusted_systemctl(path: str) -> bool:
         return False
 
 
-def systemctl_status_reason(executable, command, cwd, env, root: Path, confined: bool, *, baseline=None) -> str:
+def systemctl_status_reason(executable, command, cwd, env, root: Path, confined: bool, *, baseline=None,
+                            diagnostics=None) -> str:
     """Fixed refusal class for the two observed Core probes; empty means admitted.
 
     Child audit hooks are not inherited. Network/bus isolation relies on the verified
@@ -548,6 +561,16 @@ def systemctl_status_reason(executable, command, cwd, env, root: Path, confined:
             or any(not item or not os.path.isabs(item) for item in child["PATH"].split(os.pathsep))):
         return "path"
     if {k: v for k, v in child.items() if k != "PATH"} != {k: v for k, v in ambient.items() if k != "PATH"}:
+        if diagnostics is not None:
+            for key in set(child) | set(ambient):
+                if key == "PATH" or key in child and key in ambient and child[key] == ambient[key]:
+                    continue
+                identifier = SYSTEMCTL_ENV_IDS.get(key)
+                if identifier is None:
+                    diagnostics.add("env_unknown")
+                else:
+                    change = "add" if key not in ambient else "delete" if key not in child else "change"
+                    diagnostics.add(f"env_{identifier}_{change}")
         # Diagnostic classification only: no environment name or value is emitted.
         markers = {"AI_AGENT": "hermes-agent", "HERMES_AGENT": "true", "PYTHONUTF8": "1",
                    "PYTHONIOENCODING": "utf-8", "NO_COLOR": "1", "_HERMES_GATEWAY": "1",

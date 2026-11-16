@@ -789,7 +789,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: NousResearch/hermes-agent
-          ref: main
+          # Diagnostic-only pin. The guard below prevents latest-Core PASS.
+          ref: 5e9c0cd31e783605ada6bd6f01da505bf9b6b10b
           path: upstream-hermes
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -803,18 +804,19 @@ jobs:
         run: |
           set -eu
           commit=$(git -C upstream-hermes rev-parse HEAD)
+          test "$commit" = 5e9c0cd31e783605ada6bd6f01da505bf9b6b10b
           tree=$(git -C upstream-hermes rev-parse 'HEAD^{tree}')
           printf 'commit=%s\ntree=%s\n' "$commit" "$tree" >> "$GITHUB_OUTPUT"
           printf '%s\n' \
             '### Upstream Hermes compatibility target' \
             '- Repository: `NousResearch/hermes-agent`' \
-            '- Requested ref: `main`' >> "$GITHUB_STEP_SUMMARY"
+            '- Requested ref: `5e9c0cd31e783605ada6bd6f01da505bf9b6b10b` (diagnostic only; not latest)' >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' \
             "- Tested commit: \`$commit\`" \
             "- Tested tree: \`$tree\`" \
             "- Python: $(python --version 2>&1)" \
             "- uv: $(uv --version)" >> "$GITHUB_STEP_SUMMARY"
-          printf 'NousResearch/hermes-agent main %s\nTree %s\n' "$commit" "$tree" > upstream-hermes-provenance.txt
+          printf 'NousResearch/hermes-agent diagnostic-pin %s\nTree %s\n' "$commit" "$tree" > upstream-hermes-provenance.txt
       - name: Install official Hermes from its committed lock
         working-directory: upstream-hermes
         # The messaging extra provides the aiohttp that Core's api_server adapter requires
@@ -836,7 +838,7 @@ jobs:
         run: >-
           .venv/bin/python -c
           'import providers; from providers import register_provider; from providers.base import ProviderProfile; assert callable(register_provider); assert callable(ProviderProfile.create_client); print(providers.__file__)'
-      - name: Official catalog admission validation (upstream main)
+      - name: Official catalog admission validation (diagnostic pinned Core)
         # Same checks the official plugin-catalog CI runs at admission:
         # manifest, requires_hermes, capability probe, security scan,
         # no core override, private imports. Non-zero exit blocks.
@@ -881,6 +883,11 @@ jobs:
           python scripts/gateway_attestation.py
           --record gateway-e2e-verification.json
           --candidate "$CANDIDATE_SHA" --core "$CORE_SHA"
+      - name: Diagnostic pin cannot satisfy latest-Core compatibility
+        if: always()
+        run: |
+          printf '%s\n' 'Diagnostic Core pin is not latest-Core evidence.'
+          exit 1
       - name: Preserve sanitized Gateway evidence only
         if: always() && needs.change-scope.outputs.os_lanes == 'true'
         uses: actions/upload-artifact@v4
