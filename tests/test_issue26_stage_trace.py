@@ -79,6 +79,10 @@ def _vendor_token_scan_text(records: list[dict]) -> str:
             }
         if isinstance(value, list):
             return [strip_hashes(item) for item in value]
+        if isinstance(value, str) and value.startswith("opaque:"):
+            # Request-scoped model fingerprints are hex too: same entropy
+            # caveat as salted hashes above.
+            return "<opaque>"
         return value
 
     return json.dumps(
@@ -196,11 +200,15 @@ for line in sys.stdin:
     if method == "initialize":
         emit({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
     elif method == "session/new":
+        current = (
+            "123e4567-e89b-12d3-a456-426614174000"
+            if mode == "hostile_model" else "gemini-3.8-flash"
+        )
         emit({"jsonrpc": "2.0", "id": mid, "result": {
             "sessionId": "fake-session-SECRETSESSION0001",
             "configOptions": [{"id": "model", "category": "model",
-                "currentValue": "gemini-3.8-flash",
-                "options": [{"value": "gemini-3.8-flash"}]},
+                "currentValue": current,
+                "options": [{"value": current}]},
                 {"id": "thinking_level", "category": "think",
                  "currentValue": "high", "options": [{"value": "high"}]}],
         }})
@@ -725,6 +733,87 @@ def test_prompt_text_bytes_counts_utf8_bytes(monkeypatch, tmp_path):
     _assert_no_leaks(
         (tmp_path / "trace.jsonl").read_text(encoding="utf-8"), tmp_path, records
     )
+
+
+# ---------------------------------------------------------------------------
+# 5c. Model-id surface gate (independent re-review: credential-shaped ids)
+# ---------------------------------------------------------------------------
+
+
+HOSTILE_MODEL_UUID = "123e4567-e89b-12d3-a456-426614174000"
+HOSTILE_MODEL_KEY = "sk-1234567890abcdef"
+
+
+def test_model_surface_gate_never_echoes_credential_shapes(monkeypatch, tmp_path):
+    module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
+    hostile = [
+        HOSTILE_MODEL_UUID,
+        "ya29.a0AbCDefGhiJkLm",
+        HOSTILE_MODEL_KEY,
+        "AIzaSyDxTestKeyThatIsLongEnoughXx",
+        "a" * 40,
+    ]
+    token = client_module._TRACE_REQUEST_KEY.set("request-scope-one")
+    try:
+        classified = [client_module._classify_model_surface(v) for v in hostile]
+        same_again = client_module._classify_model_surface(HOSTILE_MODEL_UUID)
+    finally:
+        client_module._TRACE_REQUEST_KEY.reset(token)
+    for value, out in zip(hostile, classified):
+        assert value not in out, out
+        assert out not in ("", "unreported")
+    # Requested-vs-effective comparison survives inside one request scope:
+    # equal inputs hash equal, different inputs hash different.
+    assert same_again == classified[0]
+    assert classified[0] != classified[2]
+    # The fingerprint is request-scoped: the same hostile value in another
+    # request scope must not be linkable across requests.
+    token2 = client_module._TRACE_REQUEST_KEY.set("request-scope-two")
+    try:
+        other_scope = client_module._classify_model_surface(HOSTILE_MODEL_UUID)
+    finally:
+        client_module._TRACE_REQUEST_KEY.reset(token2)
+    assert other_scope != classified[0]
+    # Ordinary model names stay verbatim: the substitution-comparison feature
+    # is preserved for the normal path.
+    assert (
+        client_module._classify_model_surface("gemini-3.8-flash-high")
+        == "gemini-3.8-flash-high"
+    )
+    assert (
+        client_module._classify_model_surface("claude-sonnet-4-20250514")
+        == "claude-sonnet-4-20250514"
+    )
+    # Outside any request scope there is no comparable identity to offer.
+    assert (
+        client_module._classify_model_surface(HOSTILE_MODEL_KEY) == "unrecognized"
+    )
+
+
+def test_hostile_model_ids_never_recorded_verbatim(monkeypatch, tmp_path):
+    """UUID-shaped server currentValue + caller-supplied API-key-shaped model."""
+    module, client_module, trace_module, bridge_module = _load_plugin(monkeypatch, tmp_path, trace=True)
+    client, _ = _make_client(module, tmp_path, "hostile_model")
+    try:
+        answer, _ = client._run_prompt(
+            "hello", timeout_seconds=20.0, model=HOSTILE_MODEL_KEY
+        )
+    finally:
+        client.close()
+    assert answer == "done"
+    records = _read_trace(tmp_path / "trace.jsonl", trace_module)
+    sent = [r for r in records if r["stage"] == "prompt_sent"]
+    assert len(sent) == 1
+    detail = sent[0]["detail"]
+    assert detail["requested_model"] != HOSTILE_MODEL_KEY
+    assert detail["effective_model"] != HOSTILE_MODEL_UUID
+    assert detail["requested_model"] != detail["effective_model"]
+    text = (tmp_path / "trace.jsonl").read_text(encoding="utf-8")
+    assert HOSTILE_MODEL_KEY not in text
+    assert HOSTILE_MODEL_UUID not in text
+    assert "426614174000" not in text
+    assert "ya29." not in text
+    _assert_no_leaks(text, tmp_path, records)
 
 
 def test_disabled_by_default_produces_no_file(monkeypatch, tmp_path):
