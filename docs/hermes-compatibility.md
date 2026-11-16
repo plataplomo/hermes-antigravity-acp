@@ -2,7 +2,16 @@
 
 This plugin owns the Google ACP v1 JSON-RPC transport. Its supported Hermes extension seam is the public `providers.register_provider()` plus `ProviderProfile.create_client(**kwargs)` contract. The latter must tolerate future client keyword arguments. `agent.agent_runtime_helpers.create_openai_client()` is exercised as an integration check for Hermes dispatch; it is a Core implementation detail, not the plugin's public dependency.
 
-The independent CI job checks out `NousResearch/hermes-agent` at `main`, installs that checkout from its committed `uv.lock`, and runs the seam with strict mode. It records the tested commit/tree, Python and uv versions, lock digest, and resolved package versions. Import/setup failure is a job failure, not a skipped pass. The job does not patch Hermes Core; it asserts the plugin client is not derived from `CopilotACPClient` and verifies the upstream checkout has no tracked changes.
+The required CI job checks out the stable `NousResearch/hermes-agent` baseline, installs it from its committed `uv.lock`, and records the tested commit/tree, Python and uv versions, lock digest, and resolved package versions. A separate advisory job checks out `main`, records its tested commit/tree, and runs the catalog and strict seam tests. Import/setup failure is a job failure, not a skipped pass. Neither job patches Hermes Core. As of the [2026-11-16 baseline policy](#baseline-policy--stable-v0231-current-2026-11-16), the latest-`main` diagnostic may fail without blocking stable CI or Release, and is not compatibility evidence for the stable baseline.
+
+## Baseline policy — stable v0.23.1 (current, 2026-11-16)
+
+Maintainer-approved policy change, recorded here as the **current** policy. Every dated record below predates it and was executed under the former rule that made a live-`main` checkout a mandatory release gate; those records stay preserved as history for their own trees and rules — nothing below is rewritten.
+
+- **Mandatory stable baseline.** The required Hermes compatibility target is the official stable release **v0.23.1**: source commit `3b421578588243f920886e6fe79a6faa87ea026e`, published as the official unsigned annotated release tag [`v0.23.1`](https://github.com/NousResearch/hermes-agent/releases/tag/v0.23.1) peeling to that commit ([commit](https://github.com/NousResearch/hermes-agent/commit/3b421578588243f920886e6fe79a6faa87ea026e)), and on Docker Hub as image index digest `sha256:276d44685c65c0cb2a25f190b63c65c8906f9dc76486fb1c05ae71b5826bda08`. The strict provider seam, the CI/Release receipt and the Gateway acceptance evidence are mandatory against this stable baseline on every CI run and every release verification.
+- **Latest `main` is now advisory.** The former mandatory latest-`main` release rule is retired. The latest-`main` job keeps running as a separate advisory diagnostic: it may fail without blocking stable CI or Release, and its outcome is not evidence of compatibility with the stable baseline.
+- **Floor and security unchanged.** The declared floor `requires_hermes: ">=0.21.6"`, the `catalog-floor-gate` tests, all native platform lanes and every security gate in this file and the release matrix remain required and unchanged.
+- **Docker-image boundary (explicit).** The Docker image runtime is **not** independently tested by the source-checkout lanes or the scratch-rootfs/Gateway boundary in this repository. The image index digest above is provenance metadata recorded from Docker Hub — **not** evidence that CI executed the official image. Hosted v0.23.1: **no PASS is claimed**; only a fresh run-bound same-SHA attestation can record one.
 
 ## Dependency classes
 
@@ -135,6 +144,23 @@ Re-audit of every Hermes-core import in `hermes_compat.py` against the official 
 - **Floor re-check.** `agent/delegation_context.py`, `agent/file_safety.py`, `agent/redact.py`, `tools/skill_provenance.py`, `tools/environments/local.py`, `agent/runtime_cwd.py`, `gateway/session_context.py` and `hermes_constants` all exist at `v0.21.6` (`git cat-file -e`), with `is_delegated_child_context`, `get_nt_namespace_error`, `get_read_block_error` and `redact_sensitive_text` defined there.
 - **Enforcer added (reworked after independent review).** `tests/test_plugin_manifest.py::test_hermes_compat_core_import_surface_is_the_documented_inventory` pins the exact core-import surface of `hermes_compat.py` (6 catalog-listed + 4 documented private) in the credential-free lane, and it is the **blocking** gate — the upstream `hermes plugins validate` Rule 9 warning exits 0 and is never claimed as a blocker. Detection mirrors the official validator's `_imported()` semantics: static `import`/non-relative `from` imports **and** string-literal `importlib.import_module(...)`/`import_module(...)` calls. Hermes-owned namespaces come from `HERMES_TOP_LEVEL_SNAPSHOT`, the union of the two official Core definitions (`plugin_validate_private_imports._hermes_packages`, `plugin_validate_core_override._hermes_top_level`) over `v0.21.6`/`v0.23.0`/`v0.23.1`/`main@67664e23`; the sync check `tests/test_upstream_hermes_runtime_contracts.py::test_credential_free_namespace_snapshot_covers_installed_core` fails both upstream CI lanes if the installed Core ever reports a namespace outside the snapshot. Tightening-only deviations from the official pass, documented in the test docstring: `TYPE_CHECKING` imports are counted, per-symbol exactness replaces module-level allowance, plugin-own relative imports are skipped. Honest boundary (shared with the official static pass): computed module names (f-strings, variables) are invisible to AST scanning; the gate covers literal import spellings. Negative regressions (isolated temp files, production file untouched): unregistered `import hermes_state`, dynamic `importlib.import_module("agent.file_safety")`, unregistered `from cron import ...`, and removal of a registered import each fail; registered spellings and relative plugin imports pass.
 - **Method note.** Findings were computed by importing each ref's own `hermes_cli/plugin_validate_private_imports` from a detached worktree of the official clone and running `private_import_findings`/`private_attribute_findings` against the plugin directory (the `v0.23.0` pass used the installed v0.23.0 validator). This is the static catalog pass only; the authoritative full `hermes plugins validate` + strict seam pair runs in the `upstream-hermes-compat` and `catalog-floor-gate` CI jobs on the PR carrying this record.
+
+### Namespace inventory synchronization (2026-11-14)
+
+Official Core `422ad1861856dd9b80b947fbad9f39d1580f6b41` contains the root modules
+`hermes_state_loop_guard.py` and `hermes_state_write.py`. Both are Hermes-owned
+names under the original [`_hermes_packages()`](https://github.com/NousResearch/hermes-agent/blob/422ad1861856dd9b80b947fbad9f39d1580f6b41/hermes_cli/plugin_validate_private_imports.py)
+and [`_hermes_top_level()`](https://github.com/NousResearch/hermes-agent/blob/422ad1861856dd9b80b947fbad9f39d1580f6b41/hermes_cli/plugin_validate_core_override.py)
+definitions: both include root `*.py` stems. Extend the historical snapshot union
+above with these **two names only**; do not remove historical names.
+
+This is an import-inventory classification update, **not two new ACP Core API
+dependencies**. The public/private dependency sets and `hermes_compat.py` imports
+are unchanged. An attempted import of either new name is now inventoried and
+rejected as unregistered. The shared namespace-coverage assertion retains the
+original `reported namespaces - snapshot` rejection in both actual-Core and
+credential-free tests; omitted-module and future-unknown-name controls must fail.
+Latest/floor actual namespace checks and strict frozen-copy seams remain mandatory.
 
 ## Upstream contract proposals
 

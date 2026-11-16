@@ -17,8 +17,12 @@ independent review and Phase C Gateway CI.
 
 ## Policy (existing path classifier reused)
 
-Fast means auto-discovered fake-ACP tests/static/hygiene, latest official Core
-strict seam and minimum supported Core v0.21.6 strict seam, plus `CI gate`.
+Fast means auto-discovered fake-ACP tests/static/hygiene, the mandatory stable
+official Core v0.23.1 strict seam and minimum supported Core v0.21.6 strict
+seam, plus `CI gate`. Per the 2026-11-16 baseline policy
+([hermes-compatibility.md](hermes-compatibility.md#baseline-policy--stable-v0231-current-2026-11-16)),
+the latest-`main` strict seam is a separate advisory diagnostic: it runs and
+reports, may fail without blocking, and is not compatibility evidence.
 OS means Linux x86_64 clean room, Windows x64 actual installer and macOS ARM64.
 Extended ARM means Windows ARM64 actual installer and Linux aarch64.
 
@@ -64,7 +68,10 @@ behavior stays unchanged. Dispatch returns full scope before push parsing.
 ## Preserved contracts
 
 The stable required `CI gate` graph/strict flags/missing-or-skipped denial,
-latest/minimum Core strict checks, pytest discovery, publisher SHA-256,
+stable-v0.23.1/minimum Core strict checks (latest-`main` moved to the separate
+non-blocking advisory diagnostic under the 2026-11-16 baseline policy; the
+historical runs recorded above were executed under the former mandatory-latest
+rule), pytest discovery, publisher SHA-256,
 Windows x64/ARM64 installers, #31 cancellation/tree regressions, macOS support,
 exact-SHA release identity/stages/artifact and separate privacy/publication
 human authorization are unchanged. An unrequired skipped lane is NOT an

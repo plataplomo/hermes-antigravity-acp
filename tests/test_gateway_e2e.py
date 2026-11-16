@@ -1,0 +1,436 @@
+"""Offline contract tests for the real-Gateway driver; no Core import or operating home."""
+from __future__ import annotations
+
+from copy import deepcopy
+from unittest.mock import Mock, patch
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+from scripts.gateway_docker import CHECKS
+
+from scripts import gateway_e2e as gateway
+
+
+class GatewayEvidenceTests(unittest.TestCase):
+    def receipt(self):
+        return {"schema_version": 2, "status": "PASS", "candidate_sha": "a" * 40,
+                "boundary_refusal_reasons": [],
+                "owned_child_count": 2, "live_owned_children_after_exit": 0,
+                "hermes_commit": "b" * 40, "candidate_source_dirty": False,
+                "provider_origin": {"status": "PASS", "candidate_sha": "a" * 40, "tree_sha256": "3" * 64,
+                                    "home_sha256": "4" * 64, "frozen_copies": 0, "errors": []},
+                "scratch_cleanup": {"status": "PASS", "launch_count": 1},
+                "shutdown_diagnostic": {"status": "PASS", "launch_count": 1},
+                "confinement": {"status": "PASS", "checks": {name: True for name in CHECKS}, "pid_namespace_sha256": "1" * 64, "host_pid_namespace_sha256": "2" * 64},
+                "docker_execution": {"status": "PASS", "config_verified": True, "owned_pid_namespace_verified": True, "outside_canary_unchanged": True,
+                                     "container_removed": True, "image_removed": True},
+                "docker_contract_version": 2, "checkout_sha": "a" * 40,
+                "final_namespace_live_count": 1, "final_namespace_process_count": 1,
+                "stages": {name: {"status": "PASS", "detail": "executed"} for name in gateway.REQUIRED_STAGES}}
+
+    def test_complete_receipt_is_accepted(self):
+        self.assertEqual([], gateway.validate_receipt(self.receipt(), "a" * 40))
+
+    def test_schema_one_and_unrecorded_refusals_fail_closed(self):
+        value = self.receipt()
+        value["schema_version"] = 1
+        self.assertIn("invalid_schema", gateway.validate_receipt(value, "a" * 40))
+        value = self.receipt()
+        del value["boundary_refusal_reasons"]
+        self.assertIn("boundary_refusals_unrecorded", gateway.validate_receipt(value, "a" * 40))
+
+    def test_boundary_refusal_reasons_publish_enum_only(self):
+        self.assertEqual(["mutation_outside_disposable_root", "unapproved_subprocess"],
+                         gateway.boundary_refusal_reasons(
+                             [{"refusals": ["unapproved_subprocess", "mutation_outside_disposable_root",
+                                            "/secret/path/x.py", "with space", 7, None]},
+                              {"refusals": ["unapproved_subprocess"]}, {}]))
+
+    def test_origin_missing_wrong_sha_unbound_home_or_bad_tree_never_passes(self):
+        value = self.receipt()
+        del value["provider_origin"]
+        self.assertIn("provider_origin_not_verified", gateway.validate_receipt(value, "a" * 40))
+        for key, bad in (("status", "NOT_RUN"), ("candidate_sha", "b" * 40), ("errors", ["drift"]),
+                         ("tree_sha256", ""), ("home_sha256", None), ("frozen_copies", True), ("frozen_copies", -1)):
+            with self.subTest(key=key, bad=bad):
+                value = self.receipt()
+                value["provider_origin"][key] = bad
+                self.assertIn("provider_origin_not_verified", gateway.validate_receipt(value, "a" * 40))
+
+    def test_every_required_stage_missing_or_nonpass_fails_closed(self):
+        for stage in gateway.REQUIRED_STAGES:
+            for status in (None, "FAIL", "BLOCKED", "NOT_RUN", "SKIP", "", True):
+                with self.subTest(stage=stage, status=status):
+                    receipt = self.receipt()
+                    if status is None:
+                        receipt["stages"].pop(stage)
+                    else:
+                        receipt["stages"][stage]["status"] = status
+                    self.assertTrue(gateway.validate_receipt(receipt, "a" * 40))
+
+    def test_wrong_candidate_core_and_malformed_receipts_rejected(self):
+        for bad in (None, [], {}, True):
+            self.assertTrue(gateway.validate_receipt(bad, "a" * 40))
+        for key, value in (("candidate_sha", "c" * 40), ("hermes_commit", "main"),
+                           ("status", "BLOCKED"), ("schema_version", True), ("stages", [])):
+            receipt = deepcopy(self.receipt())
+            receipt[key] = value
+            self.assertTrue(gateway.validate_receipt(receipt, "a" * 40))
+
+    def test_ready_requires_live_pid_and_ready_state_not_http200(self):
+        good = {"pid": 101, "status": "ok", "gateway_state": "running"}
+        self.assertTrue(gateway.is_ready(good, 101))
+        for value in ({"status": "ok"}, {**good, "pid": 102}, {**good, "status": "starting"},
+                      {**good, "gateway_state": "startup_failed"}, {**good, "pid": True}, None):
+            self.assertFalse(gateway.is_ready(value, 101))
+
+    def test_readiness_diagnostics_only_publish_fixed_statuses_not_payloads(self):
+        secret = "credential-or-session-must-not-escape"
+        value = {"pid": 101, "status": "degraded", "gateway_state": "running",
+                 "prompt": secret, "readiness": {"status": "degraded", "checks": {
+                     "state_db": {"status": "degraded", "detail": "OperationalError"},
+                     "disk": {"status": "ok", "path": secret},
+                     "config": {"status": secret, "detail": secret},
+                     secret: {"status": "ok"}}}}
+        actual = gateway.readiness_observation(value, 101, 200)
+        self.assertEqual("degraded", actual["status"])
+        self.assertTrue(actual["expected_pid"])
+        self.assertEqual("degraded", actual["checks"]["state_db"])
+        self.assertEqual("unrecognized", actual["checks"]["config"])
+        self.assertNotIn(secret, str(actual))
+        self.assertNotIn("detail", str(actual))
+
+    def test_transport_diagnostics_distinguish_errors_without_exception_text(self):
+        import urllib.error
+        for error, expected in ((ConnectionRefusedError("secret"), "connection_refused"),
+                                (ConnectionResetError("secret"), "connection_reset"),
+                                (TimeoutError("secret"), "timeout"),
+                                (OSError("secret"), "unavailable")):
+            for wrapped in (error, urllib.error.URLError(error)):
+                with self.subTest(expected=expected, wrapped=type(wrapped).__name__):
+                    value = gateway.transport_observation(wrapped)
+                    self.assertEqual({"transport": expected}, value)
+                    self.assertNotIn("secret", str(value))
+
+    def test_bad_readiness_observation_never_reports_expected_pid(self):
+        for value in (None, [], {}, {"pid": True}, {"pid": 102}):
+            with self.subTest(value=value):
+                observation = gateway.readiness_observation(value, 101, 503)
+                self.assertFalse(observation["expected_pid"])
+                self.assertEqual(503, observation["http_status"])
+                self.assertFalse(gateway.is_ready(value, 101))
+
+    def test_api_server_dependency_preflight_fails_closed_before_any_launch(self):
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+        import unittest.mock
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "receipt.json"
+            with unittest.mock.patch.object(importlib.util, "find_spec", return_value=None):
+                self.assertEqual(1, gateway.main(["--hermes-root", temp, "--candidate-sha",
+                                                  "a" * 40, "--output", str(output)]))
+        self.assertFalse(output.exists())
+
+    def test_stage_fails_instead_of_promoting_cleanup_or_ready_to_success(self):
+        receipt = self.receipt()
+        for stage in ("candidate_install", "gateway_ready", "provider_factory", "initialize",
+                      "ownership_conflict", "permission_denial", "cancellation", "child_cleanup", "isolation"):
+            bad = deepcopy(receipt)
+            bad["stages"][stage] = {"status": "FAIL", "detail": "synthetic_negative"}
+            self.assertTrue(gateway.validate_receipt(bad, "a" * 40))
+
+    def test_recorded_boundary_refusal_denies_success(self):
+        # A PASS receipt can never coexist with recorded denials: cleanup() forces
+        # isolation BLOCKED sticky_boundary_refusal, so any non-empty enum is forged.
+        for reasons in (["unapproved_subprocess"], ["subprocess_executable_mismatch"],
+                        ["mutation_outside_disposable_root", "unapproved_subprocess"]):
+            with self.subTest(reasons=reasons):
+                receipt = self.receipt()
+                receipt["boundary_refusal_reasons"] = reasons
+                self.assertIn("boundary_refusal_contradicts_pass",
+                              gateway.validate_receipt(receipt, "a" * 40))
+
+    def test_live_owned_children_must_be_exact_int_zero(self):
+        # bools and floats equal zero; only exact-int typing plus the zero gate holds.
+        for bad in (1, 3, -1, True, False, 0.0, "0", None):
+            with self.subTest(live=bad):
+                receipt = self.receipt()
+                receipt["live_owned_children_after_exit"] = bad
+                self.assertIn("live_owned_children_not_zero", gateway.validate_receipt(receipt, "a" * 40))
+        missing = self.receipt()
+        del missing["live_owned_children_after_exit"]
+        self.assertIn("live_owned_children_not_zero", gateway.validate_receipt(missing, "a" * 40))
+
+    def test_owned_child_count_requires_observed_process_evidence(self):
+        # An empty owned-pid set makes child_cleanup pass vacuously; PASS needs count >= 1.
+        for bad in (0, -1, True, False, 1.0, "2", None):
+            with self.subTest(owned=bad):
+                receipt = self.receipt()
+                receipt["owned_child_count"] = bad
+                self.assertIn("owned_child_count_not_observed", gateway.validate_receipt(receipt, "a" * 40))
+        missing = self.receipt()
+        del missing["owned_child_count"]
+        self.assertIn("owned_child_count_not_observed", gateway.validate_receipt(missing, "a" * 40))
+
+    def test_schema_three_extension_is_rejected(self):
+        # No schema extension: schema 3 (refusal-spawn fingerprints) never validates here.
+        receipt = self.receipt()
+        receipt["schema_version"] = 3
+        receipt["boundary_refusal_spawns"] = []
+        self.assertIn("invalid_schema", gateway.validate_receipt(receipt, "a" * 40))
+
+
+class GatewayCleanupObservationTests(unittest.TestCase):
+    """cleanup() must never promote an empty owned-child observation to success."""
+
+    def run_object(self, root: Path):
+        run = object.__new__(gateway.Run)
+        run.contender = run.process = None
+        run.root = root
+        run.home = root / "hermes"
+        run.profile = root / "hermes" / "profiles" / "phasec"
+        run.record = {"stages": {name: {"status": "NOT_RUN", "detail": "not_executed"}
+                                 for name in gateway.REQUIRED_STAGES}}
+        return run
+
+    def test_cleanup_fixed_reason_records_for_each_forced_path(self):
+        events = [{"event": "server_started", "pid": 91111, "grandchild_pid": 92222,
+                   "started": "secret-start", "grandchild_started": "secret-child"}]
+        for trigger, expected in (("owner", "owner_sigint_timeout"),
+                                  ("contender", "contender_sigint_timeout"),
+                                  ("fixture", "fixture_child_alive")):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                run = self.run_object(root)
+                owner = Mock(pid=93333, returncode=0)
+                owner.poll.return_value = 0
+                run.process = owner
+                if trigger in {"owner", "contender"}:
+                    process = Mock(pid=94444, returncode=0)
+                    process.poll.return_value = None
+                    process.wait.side_effect = [subprocess.TimeoutExpired("private-command", 20), 0]
+                    setattr(run, "process" if trigger == "owner" else "contender", process)
+                run.events = Mock(return_value=events)
+                logs = run.home / "logs"
+                logs.mkdir(parents=True)
+                (logs / "gateway-shutdown-diag.log").write_text("=== end ===")
+                (root / "gateway-envelope.json").write_text(json.dumps({"refusals": [],
+                    "housekeeping": [{"kind": "shutdown"}]}))
+                live = Mock(return_value=False)
+                if trigger == "fixture":
+                    live.side_effect = [True, False, False, False, False, False, False, False]
+                with patch.object(gateway, "_live", live), patch.object(gateway.os, "kill"), \
+                     patch.object(gateway, "fixture_shutdown_state", return_value=(
+                         [(91111, "secret-start"), (92222, "secret-child")], [])), \
+                     patch.object(gateway.os, "killpg"):
+                    run.cleanup()
+                self.assertEqual([expected], run.record["cleanup_diagnostics"]["forced_reasons"])
+                self.assertEqual("zero", run.record["cleanup_diagnostics"]["owner_exit"])
+                self.assertEqual(0, run.record["live_owned_children_after_exit"])
+                self.assertEqual("PASS", run.record["shutdown_diagnostic"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+                encoded = json.dumps(run.record["cleanup_diagnostics"])
+                for secret in ("91111", "92222", "93333", "94444", "secret", "private-command", str(root)):
+                    self.assertNotIn(secret, encoded)
+
+    def test_cleanup_owner_exit_is_only_fixed_enum(self):
+        for returncode, expected in ((0, "zero"), (7, "nonzero"), (-9, "signal"), (None, "unknown"),
+                                     (True, "unknown")):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as temp:
+                run = self.run_object(Path(temp))
+                run.process = Mock(returncode=returncode)
+                run.process.poll.return_value = 0
+                run.cleanup()
+                self.assertEqual([], run.record["cleanup_diagnostics"]["forced_reasons"])
+                self.assertEqual(expected, run.record["cleanup_diagnostics"]["owner_exit"])
+                self.assertEqual("not_observed", run.record["cleanup_diagnostics"]["fixture_exit"]["status"])
+        with tempfile.TemporaryDirectory() as temp:
+            run = self.run_object(Path(temp))
+            run.cleanup()
+            self.assertEqual("unknown", run.record["cleanup_diagnostics"]["owner_exit"])
+
+    def test_fixture_event_matching_fails_closed_on_missing_or_reused_pid(self):
+        start = {"event": "server_started", "pid": 100, "started": "old", "grandchild_pid": 101,
+                 "grandchild_started": "child-old"}
+        newer = {"event": "server_started", "pid": 100, "started": "new", "grandchild_pid": 102,
+                 "grandchild_started": "child-new"}
+        with patch.object(gateway, "_live", return_value=False):
+            _, unmet = gateway.fixture_shutdown_state([start, {"event": "server_exited", "pid": 100}, newer])
+            self.assertEqual(["server_exited_missing"], unmet)
+            _, unmet = gateway.fixture_shutdown_state(
+                [start, {"event": "server_exited", "pid": 100}, newer, {"event": "server_exited", "pid": 100}])
+            self.assertEqual([], unmet)
+
+    def test_fixture_missing_event_or_live_grandchild_times_out_and_fails(self):
+        start = {"event": "server_started", "pid": 91111, "started": "start-token",
+                 "grandchild_pid": 92222, "grandchild_started": "child-token"}
+        for scenario in ("missing_event", "grandchild_alive"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                run = self.run_object(root)
+                run.process = Mock(returncode=0)
+                run.process.poll.return_value = 0
+                events = [start] + ([{"event": "server_exited", "pid": 91111}]
+                                    if scenario == "grandchild_alive" else [])
+                run.events = Mock(return_value=events)
+                logs = run.home / "logs"
+                logs.mkdir(parents=True)
+                (logs / "gateway-shutdown-diag.log").write_text("=== end ===")
+                (root / "gateway-envelope.json").write_text(json.dumps(
+                    {"refusals": [], "housekeeping": [{"kind": "shutdown"}]}))
+                alive = {92222} if scenario == "grandchild_alive" else set()
+                def live(pid, token):
+                    return pid in alive
+                def terminate(pid, sig):
+                    alive.discard(pid)
+                ticks = iter([0.0, 5.0, 5.0])
+                def clock():
+                    return next(ticks, 5.0)
+                with patch.object(gateway, "_live", side_effect=live), \
+                     patch.object(gateway.time, "monotonic", side_effect=clock), \
+                     patch.object(gateway.os, "kill", side_effect=terminate):
+                    run.cleanup()
+                diag = run.record["cleanup_diagnostics"]["fixture_exit"]
+                self.assertEqual("timeout", diag["status"])
+                self.assertEqual(5.0, diag["elapsed_seconds"])
+                self.assertEqual(["server_exited_missing"] if scenario == "missing_event" else ["grandchild_alive"],
+                                 diag["unmet"])
+                self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+                if scenario == "grandchild_alive":
+                    self.assertEqual(["fixture_child_alive"], run.record["cleanup_diagnostics"]["forced_reasons"])
+                else:
+                    self.assertEqual([], run.record["cleanup_diagnostics"]["forced_reasons"])
+                encoded = json.dumps(run.record["cleanup_diagnostics"])
+                for secret in ("91111", "92222", "start-token", "child-token", str(root)):
+                    self.assertNotIn(secret, encoded)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires proc start-time identity")
+    def test_real_fixture_eof_is_synchronized_without_force(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = Path(__file__).resolve().parent.parent / "scripts" / "gateway_fake_acp.py"
+            (root / "control.json").write_text('{"mode":"reply","text":"synthetic"}')
+            process = subprocess.Popen([sys.executable, str(fixture), str(root)], stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                event_path = root / "acp-events.jsonl"
+                while not event_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(event_path.exists())
+                run = self.run_object(root)
+                run.process = Mock(returncode=0)
+                stdin = process.stdin
+                assert stdin is not None
+                def close_stdin():
+                    stdin.close()
+                    return 0
+                run.process.poll.side_effect = close_stdin
+                logs = run.home / "logs"
+                logs.mkdir(parents=True)
+                (logs / "gateway-shutdown-diag.log").write_text("=== end ===")
+                (root / "gateway-envelope.json").write_text(json.dumps(
+                    {"refusals": [], "housekeeping": [{"kind": "shutdown"}]}))
+                with patch.object(gateway.os, "kill", wraps=gateway.os.kill) as kill:
+                    run.cleanup()
+                kill.assert_not_called()
+                diag = run.record["cleanup_diagnostics"]
+                self.assertEqual("complete", diag["fixture_exit"]["status"])
+                self.assertEqual([], diag["fixture_exit"]["unmet"])
+                self.assertEqual([], diag["forced_reasons"])
+                self.assertEqual("PASS", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("PASS", run.record["stages"]["child_cleanup"]["status"])
+            finally:
+                if process.stdin and not process.stdin.closed:
+                    process.stdin.close()
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires proc start-time identity")
+    def test_real_open_stdin_fixture_times_out_then_forces_fail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = Path(__file__).resolve().parent.parent / "scripts" / "gateway_fake_acp.py"
+            (root / "control.json").write_text('{"mode":"reply","text":"synthetic"}')
+            process = subprocess.Popen([sys.executable, str(fixture), str(root)], stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 5
+                event_path = root / "acp-events.jsonl"
+                while not event_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(event_path.exists())
+                run = self.run_object(root)
+                run.process = Mock(returncode=0)
+                run.process.poll.return_value = 0
+                run.cleanup()
+                diag = run.record["cleanup_diagnostics"]
+                self.assertEqual("timeout", diag["fixture_exit"]["status"])
+                self.assertGreaterEqual(diag["fixture_exit"]["elapsed_seconds"], 5.0)
+                self.assertEqual({"fixture_alive", "grandchild_alive", "server_exited_missing"},
+                                 set(diag["fixture_exit"]["unmet"]))
+                self.assertEqual(["fixture_child_alive"], diag["forced_reasons"])
+                self.assertEqual("FAIL", run.record["stages"]["shutdown"]["status"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+                self.assertEqual(0, run.record["live_owned_children_after_exit"])
+            finally:
+                if process.stdin:
+                    process.stdin.close()
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+
+    def test_empty_owned_child_set_never_marks_child_cleanup_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            run = self.run_object(Path(temp))
+            run.cleanup()
+            self.assertEqual(0, run.record["owned_child_count"])
+            self.assertEqual(0, run.record["live_owned_children_after_exit"])
+            self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+            self.assertEqual("no_owned_child_process_evidence",
+                             run.record["stages"]["child_cleanup"]["detail"])
+
+    def test_reaped_owned_child_yields_counted_zero_live_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            reaped = subprocess.Popen([sys.executable, "-c", "pass"])
+            reaped.wait()
+            (root / "owned-core-children.jsonl").write_text(
+                json.dumps({"pid": reaped.pid, "started": "0"}) + "\n",
+                encoding="utf-8")
+            run = self.run_object(root)
+            run.cleanup()
+            self.assertEqual(1, run.record["owned_child_count"])
+            self.assertEqual(0, run.record["live_owned_children_after_exit"])
+            self.assertEqual("PASS", run.record["stages"]["child_cleanup"]["status"])
+
+    def test_live_owned_child_forces_fail_and_nonzero_live_count(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                     start_new_session=True)
+            try:
+                started = Path(f"/proc/{child.pid}/stat").read_text().rsplit(")", 1)[1].split()[22 - 3]
+                (root / "owned-core-children.jsonl").write_text(
+                    json.dumps({"pid": child.pid, "started": started}) + "\n", encoding="utf-8")
+                run = self.run_object(root)
+                run.cleanup()  # bounded 6-second wait, then records the residual
+                self.assertEqual(1, run.record["owned_child_count"])
+                self.assertEqual(1, run.record["live_owned_children_after_exit"])
+                self.assertEqual("FAIL", run.record["stages"]["child_cleanup"]["status"])
+            finally:
+                child.kill()
+                child.wait()
+
+
+if __name__ == "__main__":
+    unittest.main()
