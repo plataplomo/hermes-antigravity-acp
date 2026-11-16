@@ -46,7 +46,9 @@ def validate_fault(record: object, candidate: str, core: str, run_id: str, attem
         problems.append("fault_unexecuted_stages_mismatch")
     cleanup = record.get("cleanup_diagnostics")
     fixture = cleanup.get("fixture_exit") if isinstance(cleanup, dict) else None
+    owner_seconds = cleanup.get("owner_exit_seconds") if isinstance(cleanup, dict) else None
     if (not isinstance(cleanup, dict) or cleanup.get("owner_exit") != "zero" or cleanup.get("forced_reasons") != []
+            or not isinstance(owner_seconds, (int, float)) or isinstance(owner_seconds, bool) or owner_seconds <= 0
             or not isinstance(fixture, dict) or fixture.get("status") != "complete" or fixture.get("unmet") != []):
         problems.append("fault_cleanup_not_graceful")
     return problems

@@ -256,6 +256,28 @@ class GatewayCleanupObservationTests(unittest.TestCase):
             run.cleanup()
             self.assertEqual("unknown", run.record["cleanup_diagnostics"]["owner_exit"])
 
+    def test_cleanup_owner_grace_covers_core_busy_shutdown_leash(self):
+        # A gateway interrupted with an active run may legitimately use Core's documented
+        # shutdown leash (drain 0 + watchdog grace 60s) before exiting zero. The harness must
+        # not SIGKILL it at the idle-gateway grace; exit-at-21s must classify as graceful.
+        with tempfile.TemporaryDirectory() as temp:
+            run = self.run_object(Path(temp))
+            owner = Mock(pid=95555, returncode=0)
+            owner.poll.return_value = None
+            requested: list[float] = []
+
+            def wait(timeout):
+                requested.append(timeout)
+                if timeout < 21:
+                    raise subprocess.TimeoutExpired("private-command", timeout)
+            owner.wait.side_effect = wait
+            run.process = owner
+            with patch.object(gateway.os, "killpg"):
+                run.cleanup()
+            self.assertGreaterEqual(requested[0], 60)
+            self.assertEqual([], run.record["cleanup_diagnostics"]["forced_reasons"])
+            self.assertEqual("zero", run.record["cleanup_diagnostics"]["owner_exit"])
+
     def test_fixture_event_matching_fails_closed_on_missing_or_reused_pid(self):
         start = {"event": "server_started", "pid": 100, "started": "old", "grandchild_pid": 101,
                  "grandchild_started": "child-old"}
