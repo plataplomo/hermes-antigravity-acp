@@ -22,6 +22,9 @@ SID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 @pytest.fixture
 def lanes(tmp_path, monkeypatch):
+    # Post-cutover behavior for the GC-lock test below (see test_b2_* in
+    # tests/test_issue24_f3_process_lease.py for the fence itself).
+    monkeypatch.setenv("ACP_MUX_F3_CUTOVER_ACK", "1")
     monkeypatch.setattr(mux, "STATE_PATH", str(tmp_path / "state.json"))
     monkeypatch.setattr(mux, "REGISTRY_PATH", str(tmp_path / "accounts.json"))
     monkeypatch.setattr(mux, "LOG_PATH", str(tmp_path / "mux.log"))
@@ -213,6 +216,12 @@ def test_unknown_resume_never_reaches_fake_server(lanes, tmp_path, entrypoint):
 def test_gc_reads_checkpoint_after_acquiring_gc_lock(lanes, monkeypatch):
     observed = []
     snapshot_called = threading.Event()
+    # F3: the GC only walks lanes with positively-cleared (stale) leases.
+    for home in lanes:
+        lease = Path(mux._lane_lease_path(str(home), home.name))
+        lease.parent.mkdir(parents=True, exist_ok=True)
+        lease.write_text(json.dumps({"at": 0.0, "mux_pid": 1}))
+
     def active(*, now=None, env=None):
         snapshot_called.set()
         return {SID}
