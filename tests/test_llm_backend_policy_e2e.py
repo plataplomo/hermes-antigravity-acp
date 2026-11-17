@@ -174,6 +174,8 @@ def log(payload):
     row = {
         "affinity": os.environ.get("ACP_MUX_AFFINITY", ""),
         "mux_session_id": os.environ.get("ACP_MUX_SESSION_ID", ""),
+        "session_origin": os.environ.get("ACP_MUX_SESSION_ORIGIN", ""),
+        "session_lifecycle": os.environ.get("ACP_MUX_SESSION_LIFECYCLE", ""),
         **payload,
     }
     with open(log_path, "a", encoding="utf-8") as fh:
@@ -592,3 +594,162 @@ def test_backend_mode_concurrent_identical_requests_get_fresh_sessions(
     assert all(row["affinity"] == "" for row in rows)
     assert counters == {"get": 0, "put": 0}
     assert not (tmp_path / "acp-conversation-state.json").exists()
+
+
+def test_single_mode_backend_never_receives_mux_declaration_env(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #24 F2 review: Single-mode official-server children see neither
+    declaration variable, for either policy.
+
+    A direct fake official server (no mux in the launch path) must never
+    receive MUX-only session-class metadata, and agent mode declares nothing
+    in any launch shape.
+    """
+    _write_fake_server(tmp_path, "answer")
+    module, _client_module = _load_module(monkeypatch, tmp_path)
+    default_client = _make_client(module, tmp_path)
+    default_client.chat.completions.create(
+        model="gemini-3-pro", messages=[{"role": "user", "content": "agent turn"}]
+    )
+    agent_rows = _rows(tmp_path / "fake_acp_log.jsonl")
+    assert agent_rows, "fake server must have logged the agent request"
+    assert all(row["session_origin"] == "" for row in agent_rows), (
+        "agent mode must not declare an origin: absence stays unknown"
+    )
+    assert all(row["session_lifecycle"] == "" for row in agent_rows)
+
+    backend_client = _make_client(module, tmp_path, postprocessing_policy="llm_backend")
+    backend_client.chat.completions.create(
+        model="gemini-3-pro", messages=[{"role": "user", "content": "one-shot note"}]
+    )
+    rows = _rows(tmp_path / "fake_acp_log.jsonl")
+    backend_rows = rows[len(agent_rows):]
+    assert backend_rows, "fake server must have logged the backend request"
+    assert all(row["session_origin"] == "" for row in backend_rows), (
+        "Single-mode direct official-server children must not receive the "
+        "MUX-only session-class declaration"
+    )
+    assert all(row["session_lifecycle"] == "" for row in backend_rows)
+
+
+def _env_probe_stub(tmp_path: Path, name: str) -> Path:
+    """A child that dumps its own env and exits; stands in for any launch target."""
+    stub = tmp_path / name
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,os\n"
+        f"with open({str(tmp_path / 'spawn_env.json')!r},'w',encoding='utf-8') as fh:\n"
+        "    json.dump(dict(os.environ), fh)\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _spawn_env(module, tmp_path: Path, *, args: list[str],
+               command: str | None = None, policy: str | None = None) -> dict:
+    probe = tmp_path / "spawn_env.json"
+    kwargs = {
+        "command": command or sys.executable,
+        "args": args,
+        "acp_cwd": str(tmp_path),
+        "rate_limit_retries": 0,
+    }
+    if policy is not None:
+        kwargs["postprocessing_policy"] = policy
+    client = module.antigravity_acp.create_client(**kwargs)
+    proc = client._spawn()
+    proc.wait(timeout=15)
+    return json.loads(probe.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("launch_name", [
+    "acp_mux.py", "antigravity-acp-mux.py", "antigravity-acp-mux",
+])
+def test_backend_mode_declares_only_when_launch_target_is_a_mux(
+    monkeypatch, tmp_path, launch_name
+) -> None:
+    """MUX-only declaration metadata must follow the mux, not the policy alone."""
+    stub = _env_probe_stub(tmp_path, launch_name)
+    env = _spawn_env(
+        _load_module(monkeypatch, tmp_path)[0], tmp_path,
+        args=[str(stub)], policy="llm_backend",
+    )
+    assert env.get("ACP_MUX_SESSION_ORIGIN") == "backend"
+    assert env.get("ACP_MUX_SESSION_LIFECYCLE") == "ephemeral"
+
+
+def test_backend_mode_declares_when_command_itself_is_the_mux_launcher(
+    monkeypatch, tmp_path
+) -> None:
+    launcher = _env_probe_stub(tmp_path, "antigravity-acp-mux")
+    env = _spawn_env(
+        _load_module(monkeypatch, tmp_path)[0], tmp_path,
+        args=[], command=str(launcher), policy="llm_backend",
+    )
+    assert env.get("ACP_MUX_SESSION_ORIGIN") == "backend"
+    assert env.get("ACP_MUX_SESSION_LIFECYCLE") == "ephemeral"
+
+
+def test_single_mode_backend_child_never_receives_mux_declaration_env(
+    monkeypatch, tmp_path
+) -> None:
+    stub = _env_probe_stub(tmp_path, "official_launcher_direct.py")
+    env = _spawn_env(
+        _load_module(monkeypatch, tmp_path)[0], tmp_path,
+        args=[str(stub)], policy="llm_backend",
+    )
+    assert "ACP_MUX_SESSION_ORIGIN" not in env
+    assert "ACP_MUX_SESSION_LIFECYCLE" not in env
+
+
+@pytest.mark.parametrize("extra_arg", ["acp_mux.py", "unrelated-mux"])
+def test_single_official_launcher_ignores_unrelated_mux_named_args(
+    monkeypatch, tmp_path, extra_arg
+) -> None:
+    """Only the executable or entry script can select MUX mode."""
+    launcher = _env_probe_stub(tmp_path, "antigravity-acp-official")
+    env = _spawn_env(
+        _load_module(monkeypatch, tmp_path)[0], tmp_path,
+        command=str(launcher), args=["--config", str(tmp_path / extra_arg)],
+        policy="llm_backend",
+    )
+    assert "ACP_MUX_SESSION_ORIGIN" not in env
+    assert "ACP_MUX_SESSION_LIFECYCLE" not in env
+
+
+def test_agent_mode_never_declares_even_for_a_mux_launch(monkeypatch, tmp_path) -> None:
+    stub = _env_probe_stub(tmp_path, "acp_mux.py")
+    env = _spawn_env(
+        _load_module(monkeypatch, tmp_path)[0], tmp_path,
+        args=[str(stub)],
+    )
+    assert "ACP_MUX_SESSION_ORIGIN" not in env
+    assert "ACP_MUX_SESSION_LIFECYCLE" not in env
+
+
+def test_mux_launch_detection_follows_the_packaging_bundle_list(
+    monkeypatch, tmp_path
+) -> None:
+    """The client's mux-detection naming rule must cover every packaged mux entry."""
+    _module, client_module = _load_module(monkeypatch, tmp_path)
+    scripts = PLUGIN_DIR.parent.parent / "scripts"
+    spec = importlib.util.spec_from_file_location(
+        "install_mux_sync", scripts / "install_mux.py"
+    )
+    assert spec and spec.loader
+    install_mux = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(install_mux)
+    for name in install_mux.BUNDLE_FILES:
+        assert client_module._acp_launch_is_mux(sys.executable, [str(Path("/x") / name)])
+        assert client_module._acp_launch_is_mux(str(Path("/x") / name), [])
+    # Single-mode official launch shapes are never muxes.
+    assert not client_module._acp_launch_is_mux(
+        sys.executable, ["/x/antigravity-acp-official"]
+    )
+    assert not client_module._acp_launch_is_mux("/x/antigravity-acp-official", [])
+    assert not client_module._acp_launch_is_mux(
+        sys.executable, ["/x/agy_acp_server.par"]
+    )
+    assert not client_module._acp_launch_is_mux(sys.executable, [])
