@@ -41,7 +41,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Sequence
 
 from .conversation_state import ACPConversationState, conversation_registry
 from .hermes_compat import (
@@ -699,6 +699,41 @@ def _build_subprocess_env() -> dict[str, str]:
 
 def _windows_hide_flags() -> int:
     return windows_hide_flags()
+
+
+# The provider tree deliberately carries no mux-launcher literals (enforced
+# by scripts/audit_public_tree.py and the issue #106 path contract), so mux
+# detection follows the mux packaging naming contract in scripts/install_mux
+# .py: every packaged mux entry point's basename ends with a discrete
+# ``mux`` component (optionally ``.py``), while the Single-mode official
+# launcher name does not.
+_MUX_COMPONENT_BASENAME_RE = re.compile(r"(?:^|[-_])mux(?:\.py)?$", re.IGNORECASE)
+
+
+def _acp_launch_is_mux(command: str, args: Sequence[str]) -> bool:
+    """True only when the launch target is named as a mux entry point.
+
+    MUX-only declaration metadata must follow the mux and never reach a
+    directly spawned (Single-mode) official ACP server.  Matching is on
+    the actual command basename or the Python interpreter's first script
+    argument only. Unrelated flags and trailing argument paths do not count.
+    Anything not named as a mux — the official launcher, a bare
+    interpreter, a .par path, or an unrecognized launch shape — is
+    conservatively treated as not-a-mux and declares nothing, which keeps
+    the session class ``unknown``.
+    """
+
+    def _is_mux(name: object) -> bool:
+        base = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+        return bool(_MUX_COMPONENT_BASENAME_RE.search(base))
+
+    if _is_mux(command):
+        return True
+    interpreter_base = str(command).replace("\\", "/").rsplit("/", 1)[-1]
+    is_python = re.fullmatch(
+        r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", interpreter_base, re.IGNORECASE
+    )
+    return bool(is_python and args and _is_mux(args[0]))
 
 
 def _jsonrpc_result(message_id: Any, result: Any) -> dict[str, Any]:
@@ -4778,6 +4813,20 @@ class AntigravityACPClient:
             else "0"
         )
         child_env["ACP_MUX_AFFINITY_PIN"] = "1" if pin_affinity else "0"
+        # Session-class declaration (issue #24 F2): the explicit llm_backend
+        # one-shot policy declares backend/ephemeral, but only when the
+        # configured launch target actually IS a mux — the canonical mux
+        # entry points are the only consumers of these variables, and the
+        # mux strips them before its own vendor spawn.  A Single-mode direct
+        # official-server child never receives MUX-only metadata; an
+        # unrecognized launch shape declares nothing (absence stays unknown,
+        # the conservative F2 default).  Plugin-owned constants, never
+        # inherited values; agent mode declares nothing in any shape.
+        if self._llm_backend_postprocessing and _acp_launch_is_mux(
+            self._acp_command, self._acp_args
+        ):
+            child_env["ACP_MUX_SESSION_ORIGIN"] = "backend"
+            child_env["ACP_MUX_SESSION_LIFECYCLE"] = "ephemeral"
         # Stage tracing (issue #26): the child env filter strips operator
         # ACP_MUX_* keys by design, so mux trace enablement must be explicit
         # here (a plugin-owned constant, never an inherited value). The mux
