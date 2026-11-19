@@ -58,6 +58,22 @@ Environment:
                           heartbeat; defaults to the owner grace.  A lane
                           lease is taken automatically whenever flock is
                           available; there is no opt-out, only this window.
+  ACP_MUX_F4_PROCESS_TREE_ACK  issue #24 F4 gate B: must be exactly 1 for
+                          the native GC to delete anything.  The operator
+                          acknowledges first-hand process-tree evidence
+                          (issue #25) that no vendor-spawned descendant can
+                          outlive its direct official child and touch a
+                          session store.  Without it the GC runs in
+                          audit-only mode: it logs what a bounded pass
+                          would delete and deletes nothing.
+  ACP_MUX_GC_MAX_DELETIONS  issue #24 F4: hard cap on bundles deleted per
+                          GC pass across all lanes; defaults to 8.
+  ACP_MUX_GC_MAX_BYTES    issue #24 F4: hard byte cap per GC pass; defaults
+                          to 64 MiB.  A bundle that would cross either cap
+                          is left for a later pass.
+  ACP_MUX_GC_PASS_DEADLINE_SECONDS  issue #24 F4: wall-clock budget for one
+                          deletion pass; checked before every bundle;
+                          defaults to 10 seconds.
   ACP_MUX_SESSION_ORIGIN  optional per-connection session-class declaration
                           stamped into the owner record at session/new
                           (issue #24 F2); strict enum agent|backend, any
@@ -65,9 +81,11 @@ Environment:
   ACP_MUX_SESSION_LIFECYCLE  optional per-connection declaration of whether
                           the creator intends future reuse (issue #24 F2);
                           strict enum ephemeral|durable, anything else
-                          records unknown.  A declaration is classification
-                          metadata only: it never licenses deletion by
-                          itself (F3/F4 are separate phases).  Neither
+                          records unknown.  A declaration never licenses
+                          deletion by itself; since issue #24 F4 (review
+                          R2) an ``ephemeral`` declaration on a registered
+                          lane is a necessary — never sufficient — part of
+                          the deletion-authority evidence.  Neither
                           variable is passed to the official subprocess.
   ACP_MUX_AUTH_COOLDOWN   auth failure cooldown seconds (default 300)
   ACP_MUX_QUOTA_COOLDOWN  quota/rate-limit cooldown seconds (default 900)
@@ -299,6 +317,33 @@ LEASE_GRACE_SECONDS = _configured_positive_int(
 # acquisition is non-blocking with retries, and a bind that cannot take the
 # lease within this window fails closed instead of spawning unleased.
 _LEASE_ACQUIRE_TIMEOUT_SECONDS = 5.0
+
+# Issue #24 F4: how long a deletion pass may wait to take a lane lease
+# exclusively before it abandons that lane (fail closed: contended lanes are
+# never deleted from).  Kept well under the bind-side acquire window so a
+# pass can never starve binds beyond their own bounded retries.
+_LEASE_HOLD_TIMEOUT_SECONDS = 2.0
+
+# Issue #24 F4: bounded-deletion budgets for one GC pass.  Deliberately
+# conservative defaults: a pass that would exceed any budget stops early and
+# leaves the remaining candidates to a later pass.  Deleted files are not
+# recoverable, so the design goal is a bounded blast radius with a
+# verifiable postcondition, not rollback.
+GC_MAX_DELETIONS = _configured_positive_int(
+    "ACP_MUX_GC_MAX_DELETIONS",
+    "HERMES_ANTIGRAVITY_ACP_GC_MAX_DELETIONS",
+    8,
+)
+GC_MAX_BYTES = _configured_positive_int(
+    "ACP_MUX_GC_MAX_BYTES",
+    "HERMES_ANTIGRAVITY_ACP_GC_MAX_BYTES",
+    64 * 1024 * 1024,
+)
+GC_PASS_DEADLINE_SECONDS = _configured_positive_int(
+    "ACP_MUX_GC_PASS_DEADLINE_SECONDS",
+    "HERMES_ANTIGRAVITY_ACP_GC_PASS_DEADLINE_SECONDS",
+    10,
+)
 
 # Issue #24 F2: the only values an origin/lifecycle declaration may hold.
 # Anything else (including absence) is "unknown", which is deliberately not
@@ -888,6 +933,88 @@ def _lane_lease_states_aggregate(states: list[str]) -> str:
     return "stale"
 
 
+class _LaneLeaseHold:
+    """Hold one lane lease exclusively across a bounded deletion pass.
+
+    Issue #24 F4 (gate A): the stale-lease proof must survive from the probe
+    until the last unlink.  A probe-then-release window lets a fresh mux
+    bind (shared lock) and spawn an official child between the GC's stale
+    check and its deletion.  Taking the lease *exclusively* for the whole
+    per-home pass closes that window by construction: any bind that races
+    the pass cannot take its shared lease, so it never spawns (review B4
+    fail-closed path), and the heartbeat is re-read under the lock — the
+    state reported here is first-hand under hold, never a reused probe.
+    """
+
+    def __init__(self, home: str, label: str, *, now: float) -> None:
+        self.state = "absent"
+        self._fd = -1
+        if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+            self.state = "unsupported"
+            return
+        path = _lane_lease_path(home, label)
+        try:
+            # Never create: an absent lease file is unknown evidence, and
+            # the F3 policy protects lanes without positive stale proof.
+            self._fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return
+        except OSError:
+            self.state = "unavailable"
+            return
+        try:
+            deadline = time.monotonic() + _LEASE_HOLD_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        self.state = "contended"
+                        self.close()
+                        return
+                    time.sleep(0.05)
+            try:
+                os.lseek(self._fd, 0, os.SEEK_SET)
+                data = json.loads(os.read(self._fd, 65536).decode("utf-8"))
+                at = data.get("at") if isinstance(data, dict) else None
+                if (
+                    isinstance(at, bool)
+                    or not isinstance(at, (int, float))
+                    or not math.isfinite(at)
+                ):
+                    raise ValueError("lease heartbeat unreadable")
+            except (OSError, ValueError, TypeError, UnicodeError):
+                self.state = "unavailable"
+                self.close()
+                return
+            self.state = "stale" if at + LEASE_GRACE_SECONDS <= now else "grace"
+            if self.state != "stale":
+                self.close()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            fd, self._fd = self._fd, -1
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __enter__(self) -> "_LaneLeaseHold":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
 class _LaneLease:
     """Hold a shared lane lease for the lifetime of one official ACP child.
 
@@ -1469,8 +1596,17 @@ def _safe_tree_size(path: Path) -> int | None:
     return None if errors else total
 
 
-def _delete_session_bundle(store: Path, record: dict) -> tuple[bool, int]:
-    """Delete only one validated DB/meta/brain bundle under the ACP store."""
+def _delete_session_bundle(
+    store: Path, record: dict, *, max_bytes: int | None = None
+) -> tuple[bool, int]:
+    """Delete only one validated DB/meta/brain bundle under the ACP store.
+
+    ``max_bytes`` (issue #24 F4 review R8) is the footprint the caller has
+    already reserved: immediately before the first mutation the real
+    delete-target footprint is re-measured here, and anything larger (or
+    unreadable) is refused non-destructively with zero mutation.  ``None``
+    keeps the legacy unbounded behavior for direct callers.
+    """
     if record["unsafe"]:
         return False, 0
     session_id = record["session_id"]
@@ -1504,6 +1640,12 @@ def _delete_session_bundle(store: Path, record: dict) -> tuple[bool, int]:
         if measured is None:
             return False, 0
         brain_size = measured
+
+    if max_bytes is not None and size + brain_size > max_bytes:
+        # R8: the footprint grew past the reserved estimate between the
+        # slot's single measurement and this point.  The byte hard bound
+        # is never retroactively widened: refuse, touch nothing.
+        return False, 0
 
     try:
         if brain_path.exists():
@@ -1566,13 +1708,18 @@ def _capacity_gc_candidates(
     active_session_ids: set[str],
     *,
     cap: int,
+    limit: int | None = None,
 ) -> list[str]:
     """Session IDs above the per-store cap the native GC evicts, oldest first.
 
     Shared by ``_prune_session_store`` (deletes) and ``session_inventory``
     (reports only); unsafe and checkpoint-active records are never evictable.
+    ``limit`` widens the returned eviction order beyond the immediate excess
+    so callers can simulate owner-gated replacement (a guarded oldest bundle
+    is skipped and the next-oldest evictable takes its slot).
     """
     excess = max(0, len(remaining) - cap)
+    want = excess if limit is None else min(limit, len(remaining))
     evictable = sorted(
         (
             (session_id, record)
@@ -1581,7 +1728,29 @@ def _capacity_gc_candidates(
         ),
         key=lambda item: activities[item[0]],
     )
-    return [session_id for session_id, _ in evictable[:excess]]
+    return [session_id for session_id, _ in evictable[:want]]
+
+
+def _owner_gate_lane_digests(home: str) -> set[str] | None:
+    """Owner-lane digests that prove a bundle belongs to this store's home.
+
+    Derived from the validated registry (``_ownership_accounts``); ``None``
+    means the registry itself is unreadable and no deletion authority can be
+    established for any lane of this home.
+    """
+    lanes = _ownership_accounts()
+    if lanes is None:
+        return None
+    normalized = os.path.abspath(os.path.expanduser(str(home)))
+    return {
+        _owner_hash(key)
+        for lane_home, _label, key in lanes
+        if os.path.abspath(os.path.expanduser(lane_home)) == normalized
+    }
+
+
+class _RevalidationAborted(Exception):
+    """Fresh evidence became unreadable mid-pass (fail closed)."""
 
 
 def _prune_session_store(
@@ -1589,8 +1758,38 @@ def _prune_session_store(
     active_session_ids: set[str],
     *,
     now: float,
+    budget: dict[str, int] | None = None,
+    deadline: float | None = None,
+    audit: bool = False,
 ) -> dict[str, int]:
+    """Delete (or, in audit mode, plan) this store's GC candidates.
+
+    Issue #24 F4 (review R1-R4): every deletion slot re-validates from
+    fresh first-hand evidence immediately before its own destructive
+    mutation — a fresh checkpoint-inventory read, a fresh activity re-stat,
+    a fresh owner-ledger read, and the budget checks.  The delete-authority
+    predicate per slot is: TTL-expired (expired path) or still excess and
+    evictable under freshly recomputed activities (capacity path), not
+    checkpoint-active, and positive owner evidence (owner record exists,
+    its lane belongs to this store's registered lanes, and its declared
+    lifecycle is exactly ``ephemeral``).  Unknown, durable, missing,
+    lane-mismatched, or unreadable evidence never deletes.  Budget cost is
+    reserved before the first destructive mutation and never refunded, and
+    the first deletion failure stops the rest of the pass.  Budget
+    exhaustion stops the pass early (``budget["stopped"]``); remaining
+    candidates survive to a later pass.  In audit mode nothing is unlinked:
+    the same selection, revalidation, and budget accounting runs and the
+    totals describe what a real pass *would* delete.
+    """
     result = {"expired": 0, "capacity": 0, "bytes": 0, "failed": 0}
+    if budget is None:
+        # Direct callers get the same budgets; they simply cannot observe
+        # the stop flag afterwards.
+        budget = {"deletions": 0, "bytes": 0, "stopped": 0}
+    lane_digests = _owner_gate_lane_digests(home)
+    if lane_digests is None:
+        _log("session-gc revalidation-aborted: owner lane registry unreadable")
+        return result
     store = _session_store_root(home)
     if store is None:
         return result
@@ -1601,35 +1800,147 @@ def _prune_session_store(
 
     activities = _session_gc_activities(records, now=now)
 
-    removed: set[str] = set()
-    for session_id in _expired_gc_candidates(
-        records, activities, active_session_ids, now=now
-    ):
-        deleted, freed = _delete_session_bundle(store, records[session_id])
-        if deleted:
-            removed.add(session_id)
-            result["expired"] += 1
-            result["bytes"] += freed
-        else:
-            records[session_id]["unsafe"] = True
-            result["failed"] += 1
+    def _budget_estimate(record: dict) -> int | None:
+        """Byte footprint estimate, or None when unmeasurable."""
+        return _lane_bundle_bytes(store, {record["session_id"]: record})
 
-    remaining = [
-        (session_id, record)
-        for session_id, record in records.items()
-        if session_id not in removed
-    ]
-    for session_id in _capacity_gc_candidates(
-        remaining, activities, active_session_ids, cap=AFFINITY_MAX_ENTRIES
-    ):
-        deleted, freed = _delete_session_bundle(store, records[session_id])
+    def _budget_verdict(estimate: int | None) -> str:
+        """``ok`` / ``skip`` / ``stop`` for a bundle under the budgets."""
+        if deadline is not None and time.monotonic() >= deadline:
+            return "stop"
+        if budget["deletions"] >= GC_MAX_DELETIONS:
+            return "stop"
+        if estimate is None:
+            # Unmeasurable footprint: never let it through an exact byte
+            # budget it cannot be checked against (fail closed per bundle).
+            return "skip"
+        if budget["bytes"] + estimate > GC_MAX_BYTES:
+            return "stop"
+        return "ok"
+
+    def _fresh_active() -> set[str]:
+        fresh = _active_hermes_session_ids(now=time.time())
+        if fresh is None:
+            raise _RevalidationAborted
+        return fresh
+
+    def _owner_evidence_allows(session_id: str) -> bool:
+        """Fresh positive owner/lifecycle evidence for this exact bundle."""
+        owners = _read_session_owners()
+        if owners is None:
+            raise _RevalidationAborted
+        entry = owners.get(_owner_hash(session_id))
+        if entry is None or entry["lane"] not in lane_digests:
+            return False
+        return entry.get("lifecycle") == "ephemeral"
+
+    def _reserve_and_delete(session_id: str, kind: str, estimate: int) -> str:
+        """Returns ``ok`` or ``stop``.  Reserved cost is never refunded."""
+        record = records[session_id]
+        if deadline is not None and time.monotonic() >= deadline:
+            # R9: fresh evidence ran past the wall-clock budget after the
+            # verdict; stop with zero reservation and zero mutation.
+            return "stop"
+        budget["deletions"] += 1
+        budget["bytes"] += estimate
+        if audit:
+            result[kind] += 1
+            result["bytes"] += estimate
+            return "ok"
+        deleted, freed = _delete_session_bundle(store, record, max_bytes=estimate)
         if deleted:
-            removed.add(session_id)
-            result["capacity"] += 1
+            result[kind] += 1
             result["bytes"] += freed
-        else:
-            records[session_id]["unsafe"] = True
-            result["failed"] += 1
+            return "ok"
+        record["unsafe"] = True
+        result["failed"] += 1
+        # A failure here may already have destroyed part of the bundle
+        # (brain tree before DB files).  Nothing is refunded, rolled back,
+        # or pretended otherwise: the pass stops immediately fail-closed.
+        return "stop"
+
+    removed: set[str] = set()
+    try:
+        for session_id in _expired_gc_candidates(
+            records, activities, active_session_ids, now=now
+        ):
+            if not _owner_evidence_allows(session_id):
+                continue
+            # R5: the footprint is measured exactly once per slot; the
+            # same value drives the budget verdict and the reservation,
+            # and an unmeasurable footprint is never coerced to 0.
+            estimate = _budget_estimate(records[session_id])
+            verdict = _budget_verdict(estimate)
+            if verdict == "stop":
+                budget["stopped"] = 1
+                break
+            if verdict == "skip" or estimate is None:
+                continue
+            fresh_active = _fresh_active()
+            fresh_activity = _session_record_mtime(records[session_id])
+            if (
+                fresh_activity is None
+                or fresh_activity >= time.time() - AFFINITY_TTL_SECONDS
+                or session_id in fresh_active
+            ):
+                continue
+            if _reserve_and_delete(session_id, "expired", estimate) == "stop":
+                budget["stopped"] = 1
+                break
+            removed.add(session_id)
+
+        excluded: set[str] = set()
+        while not budget["stopped"]:
+            remaining = [
+                (session_id, record)
+                for session_id, record in records.items()
+                if session_id not in removed
+            ]
+            if max(0, len(remaining) - AFFINITY_MAX_ENTRIES) <= 0:
+                break
+            fresh_active = _fresh_active()
+            fresh_activities = dict(activities)
+            for session_id, record in remaining:
+                fresh_activity = _session_record_mtime(record)
+                if fresh_activity is None:
+                    record["unsafe"] = True
+                    fresh_activity = now + AFFINITY_TTL_SECONDS
+                fresh_activities[session_id] = fresh_activity
+            # R4: eligibility and oldest-first ranking are recomputed from
+            # freshly re-statted activity at every slot; the plan from the
+            # previous iteration is never executed.
+            candidates = [
+                session_id
+                for session_id in _capacity_gc_candidates(
+                    remaining, fresh_activities, fresh_active,
+                    cap=AFFINITY_MAX_ENTRIES, limit=len(remaining),
+                )
+                if session_id not in excluded
+            ]
+            if not candidates:
+                break
+            session_id = candidates[0]
+            if not _owner_evidence_allows(session_id):
+                # Guarded oldest bundle: the next-oldest evictable takes
+                # its slot (never the guarded one).
+                excluded.add(session_id)
+                continue
+            # R5: one fresh measurement per slot, shared by verdict and
+            # reservation; None is never converted to 0.
+            estimate = _budget_estimate(records[session_id])
+            verdict = _budget_verdict(estimate)
+            if verdict == "stop":
+                budget["stopped"] = 1
+                break
+            if verdict == "skip" or estimate is None:
+                excluded.add(session_id)
+                continue
+            if _reserve_and_delete(session_id, "capacity", estimate) == "stop":
+                budget["stopped"] = 1
+                break
+            removed.add(session_id)
+    except _RevalidationAborted:
+        _log("session-gc revalidation-aborted: fresh evidence unreadable")
     return result
 
 
@@ -1762,11 +2073,20 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
             "(ACP_MUX_F3_CUTOVER_ACK=1 required after verified legacy drain)"
         )
         return None
+    # Issue #24 F4 (gate B): a stale lease never proves vendor-spawned
+    # descendants (issue #25 server -> local-harness) are gone; POSIX gives
+    # no primitive to bind a lifetime the mux never created.  Until the
+    # operator acknowledges first-hand process-tree evidence, deletion
+    # authority stays NO-GO and the pass runs audit-only: identical
+    # selection, revalidation, and budget accounting, zero unlinks.
+    audit_mode = os.environ.get("ACP_MUX_F4_PROCESS_TREE_ACK", "").strip() != "1"
     entries, meta, _problem = _load_registry_data()
     default_home, _explicit = _effective_default_home(meta)
     lane_labels = _registry_lane_labels(default_home, entries)
 
     totals = {"expired": 0, "capacity": 0, "bytes": 0, "failed": 0}
+    budget = {"deletions": 0, "bytes": 0, "stopped": 0}
+    deadline = time.monotonic() + GC_PASS_DEADLINE_SECONDS
     lease_protected_lanes = 0
     with _session_gc_lock() as locked:
         if not locked:
@@ -1777,25 +2097,63 @@ def prune_session_stores(*, now: float | None = None) -> dict[str, int] | None:
             _log("session-gc skipped: continuation checkpoint inventory unavailable")
             return None
         for home in sorted(lane_labels):
-            # Issue #24 F3: a store is skipped unless every registered lane
-            # for it is positively cleared (stale lease).  A live holder, a
-            # fresh post-death heartbeat, a missing lease file, or an
-            # unreadable one all keep the whole store untouched: a child
-            # process may hold any bundle in its own store open, and which
-            # ones is vendor-internal knowledge we never infer.
-            states = [
-                _lane_lease_state(home, label, now=now)
-                for label in sorted(lane_labels[home])
-            ]
-            if any(_lane_lease_protected(state) for state in states):
-                lease_protected_lanes += 1
-                continue
-            result = _prune_session_store(home, active, now=now)
-            for key in totals:
-                totals[key] += result[key]
+            if budget["deletions"] >= GC_MAX_DELETIONS:
+                budget["stopped"] = 1
+                break
+            holds: list[_LaneLeaseHold] = []
+            try:
+                labels = sorted(lane_labels[home])
+                if audit_mode:
+                    # Read-only planning needs no hold; the probe is enough
+                    # evidence for a report that deletes nothing.
+                    states = [
+                        _lane_lease_state(home, label, now=now)
+                        for label in labels
+                    ]
+                    if any(_lane_lease_protected(state) for state in states):
+                        lease_protected_lanes += 1
+                        continue
+                else:
+                    # Gate A: hold every registered lane of this home
+                    # exclusively, with the stale heartbeat re-read under
+                    # the lock, for the whole deletion pass.  A bind racing
+                    # the pass cannot take its shared lease and so never
+                    # spawns against a store being deleted.
+                    cleared = True
+                    for label in labels:
+                        hold = _LaneLeaseHold(home, label, now=now)
+                        if hold.state != "stale":
+                            hold.close()
+                            cleared = False
+                            break
+                        holds.append(hold)
+                    if not cleared:
+                        lease_protected_lanes += 1
+                        continue
+                result = _prune_session_store(
+                    home,
+                    active,
+                    now=now,
+                    budget=budget,
+                    deadline=deadline,
+                    audit=audit_mode,
+                )
+                for key in totals:
+                    totals[key] += result[key]
+            finally:
+                for hold in holds:
+                    hold.close()
 
     if lease_protected_lanes:
         _log(f"session-gc lease-protected-lanes={lease_protected_lanes}")
+    if budget["stopped"]:
+        _log("session-gc budget-stopped=1")
+    if audit_mode:
+        _log(
+            "session-gc-audit expired={expired} capacity={capacity} "
+            "failed={failed} bytes={bytes} deletions=0".format(**totals)
+        )
+        return totals
     if any(totals.values()):
         _log(
             "session-gc expired={expired} capacity={capacity} failed={failed} bytes={bytes}".format(
@@ -1841,7 +2199,7 @@ def _lane_bundle_bytes(store: Path, records: dict[str, dict]) -> int | None:
 
 def _lane_inventory(
     lane: int, home: str, active: set[str], owners: dict[str, dict], *,
-    now: float, lease_state: str,
+    now: float, lease_state: str, lane_digests: set[str],
 ) -> dict:
     """Read-only per-lane bundle census; deletes nothing; reports no identifiers."""
     out: dict[str, Any] = {
@@ -1862,9 +2220,11 @@ def _lane_inventory(
         # cannot drift from what prune_session_stores would actually touch.
         "lease": lease_state,
         # Issue #24 F2: declared session classes of owner-linked bundles.
-        # Classification evidence only — a bucket is never a reclamation
-        # verdict (F3 leases and F4 budgets are separate phases).  Bundles
-        # without an owner record carry no declaration and never appear here.
+        # A bucket is never a reclamation verdict on its own — but since
+        # review R2 the declaration is a *necessary* part of deletion
+        # authority: only ``ephemeral`` owner evidence on a registered
+        # lane makes a bundle a candidate at all.  Bundles without an
+        # owner record carry no declaration and never appear here.
         "origin_lifecycle": {
             origin: {lifecycle: 0 for lifecycle in _SESSION_CLASS_MATRIX[1]}
             for origin in _SESSION_CLASS_MATRIX[0]
@@ -1891,16 +2251,40 @@ def _lane_inventory(
         return out
 
     activities = _session_gc_activities(records, now=now)
-    expired = _expired_gc_candidates(records, activities, active, now=now)
+
+    def _deletable(session_id: str) -> bool:
+        # F4 review R2 parity: the GC's delete-authority predicate requires
+        # positive owner evidence (existing record, lane belongs to this
+        # home, lifecycle exactly ephemeral).  The prediction must not
+        # drift from it.
+        entry = owners.get(_owner_hash(session_id))
+        if entry is None or entry["lane"] not in lane_digests:
+            return False
+        return entry.get("lifecycle") == "ephemeral"
+
+    expired = [
+        session_id
+        for session_id in _expired_gc_candidates(records, activities, active, now=now)
+        if _deletable(session_id)
+    ]
     expired_set = set(expired)
     remaining = [
         (session_id, record)
         for session_id, record in records.items()
         if session_id not in expired_set
     ]
-    capacity = _capacity_gc_candidates(
-        remaining, activities, active, cap=AFFINITY_MAX_ENTRIES
+    # R4 parity: the GC recomputes eligibility per slot and a guarded
+    # (non-deletable) oldest evictable bundle is replaced by the
+    # next-oldest deletable one, so the prediction scans the full
+    # eviction order and keeps only the first `excess` deletable bundles.
+    excess = max(0, len(remaining) - AFFINITY_MAX_ENTRIES)
+    eviction_order = _capacity_gc_candidates(
+        remaining, activities, active, cap=AFFINITY_MAX_ENTRIES,
+        limit=len(remaining),
     )
+    capacity = [
+        session_id for session_id in eviction_order if _deletable(session_id)
+    ][:excess]
     capacity_set = set(capacity)
 
     out["bundles"] = len(records)
@@ -1949,9 +2333,17 @@ def session_inventory(
     applies the same decision helpers as ``prune_session_stores`` and only
     reports what the opt-in native GC *would* select under current policy.
     A candidate is NOT a reclamation verdict: lane process leases (F3) are
-    consulted and lease-protected lanes report zero candidates, but no
-    bounded-deletion checks exist yet and lifecycle declarations are still
-    never consulted (issue #24 C1/C4; F4 is a separate phase).
+    consulted and lease-protected lanes report zero candidates, candidates
+    additionally reflect the F4 owner-evidence gate (a readable ledger, an
+    owner record on a registered lane of this home, lifecycle declared
+    exactly ``ephemeral``; unknown, durable, missing, or lane-mismatched
+    evidence is never a candidate), and the per-pass exclusive lease hold,
+    budget reservations, and destructive postconditions run only in the
+    GC path, never here.  The budget figures appear under ``policy`` for
+    context; the candidate census is a policy prediction, not the result
+    of one budget-limited pass.  Production deletion authority stays
+    NO-GO until the issue #25 process-tree evidence ack is set
+    (issue #24 C1/C4).
 
     Privacy: raw session ids, account labels, homes, and paths never
     appear; lanes are positional indexes and every value is a count, a
@@ -1986,15 +2378,27 @@ def session_inventory(
             "fleet_cutover_ack": (
                 os.environ.get("ACP_MUX_F3_CUTOVER_ACK", "").strip() == "1"
             ),
+            # Issue #24 F4: bounded-deletion budgets and the process-tree
+            # evidence gate are part of the reported policy.
+            "gc_max_deletions": GC_MAX_DELETIONS,
+            "gc_max_bytes": GC_MAX_BYTES,
+            "gc_pass_deadline_seconds": GC_PASS_DEADLINE_SECONDS,
+            "process_tree_ack": (
+                os.environ.get("ACP_MUX_F4_PROCESS_TREE_ACK", "").strip() == "1"
+            ),
         },
         "deletions_performed": 0,
         "reclaim_certainty": (
             "gc_candidate_prediction_only; lane process leases (F3) cover "
             "the mux and its direct official child only, vendor-descendant "
-            "liveness is unproven (issue #25 gates F4), and the pre-F3 "
-            "fleet cutover fence, the check-to-delete revalidation hold, "
-            "and bounded-deletion checks do not exist yet and lifecycle "
-            "declarations are never consulted (issue #24 C1-C4; F4 pending)"
+            "liveness is unproven (issue #25 process-tree evidence gates "
+            "F4 deletion authority), the pre-F3 fleet cutover fence is an "
+            "operator ack, and candidates additionally require positive "
+            "owner evidence (owner record on a registered lane of this "
+            "home with lifecycle declared ephemeral); unknown, durable, "
+            "missing, or lane-mismatched evidence is never a candidate "
+            "(issue #24 C1-C4; F4 hold/budgets exist in code but are "
+            "unexercised in production)"
         ),
         "lanes": [],
         "totals": {},
@@ -2023,6 +2427,17 @@ def session_inventory(
         owners = _read_session_owners()
         if owners is None:
             return _incomplete("ownership-ledger-unavailable")
+        # F4 review R2 parity: candidate predictions apply the GC's owner
+        # gate, which is anchored to the validated registry's lane set.
+        owner_lanes = _ownership_accounts()
+        if owner_lanes is None:
+            return _incomplete("owner-lanes-unavailable")
+        lane_digests_by_home: dict[str, set[str]] = {}
+        for lane_home, _label, key in owner_lanes:
+            normalized = os.path.abspath(os.path.expanduser(lane_home))
+            lane_digests_by_home.setdefault(normalized, set()).add(
+                _owner_hash(key)
+            )
         totals: dict[str, Any] = {
             "bundles": 0,
             "bytes": 0,
@@ -2046,7 +2461,8 @@ def session_inventory(
             ])
             lease_protected_lanes += int(_lane_lease_protected(lease_state))
             lane_report = _lane_inventory(
-                lane, home, active, owners, now=now, lease_state=lease_state
+                lane, home, active, owners, now=now, lease_state=lease_state,
+                lane_digests=lane_digests_by_home.get(home, set()),
             )
             report["lanes"].append(lane_report)
             if lane_report["status"] != "ok":
