@@ -59,7 +59,11 @@ from .hermes_compat import (
     windows_hide_flags,
 )
 from .native_limit_state import native_limit_registry
-from .process_teardown import terminate_process_tree
+from .process_teardown import (
+    proc_dead_unreaped,
+    proc_exit_status_unreaped,
+    terminate_process_tree,
+)
 from .request_trace import get_tracer, silence_seconds
 from .bridge import (
     MalformedToolCallError,
@@ -4114,7 +4118,10 @@ class AntigravityACPClient:
         with _warm_pool_lock:
             kept: list[dict[str, Any]] = []
             for entry in _warm_pool.get(key, []):
-                dead = entry["proc"].poll() is not None
+                # Non-reaping liveness (issue #25): a dead leader must reach
+                # terminate_process_tree UNREAPED so its owned group can
+                # still be captured and swept.
+                dead = proc_dead_unreaped(entry["proc"])
                 expired = now - entry["idle_since"] > _WARM_IDLE_TTL_SECONDS
                 if dead or expired:
                     victims.append(entry)
@@ -4142,9 +4149,10 @@ class AntigravityACPClient:
 
     def _warm_park(self, entry: dict[str, Any]) -> None:
         global _warm_pool_atexit_armed
-        if entry["proc"].poll() is not None:
+        if proc_dead_unreaped(entry["proc"]):
             # The child died between the last request and release; never
-            # park a corpse.
+            # park a corpse.  Handed off UNREAPED (issue #25) so the
+            # teardown can still capture group ownership and sweep.
             self._release_process(entry["proc"])
             return
         entry["idle_since"] = time.monotonic()
@@ -4154,7 +4162,7 @@ class AntigravityACPClient:
         with _warm_pool_lock:
             bucket: list[dict[str, Any]] = []
             for parked in _warm_pool.get(entry["key"], []):
-                if parked["proc"].poll() is None:
+                if not proc_dead_unreaped(parked["proc"]):
                     bucket.append(parked)
                 else:
                     victims.append(parked)
@@ -5082,7 +5090,7 @@ class AntigravityACPClient:
                         "Antigravity ACP request cancelled by Hermes interrupt during send."
                     ) from None
                 raise
-            while time.monotonic() < session_deadline and proc.poll() is None:
+            while time.monotonic() < session_deadline and not proc_dead_unreaped(proc):
                 if _cancelled():
                     raise _AcpCancelledError(
                         "Antigravity ACP request cancelled by Hermes interrupt."
@@ -5207,14 +5215,18 @@ class AntigravityACPClient:
                 raise _AcpCancelledError(
                     "Antigravity ACP request cancelled by Hermes interrupt."
                 )
-            if proc.poll() is not None:
+            if proc_dead_unreaped(proc):
+                # Non-reaping probe keeps the zombie leader (and its group
+                # ownership) intact for the dispose path below; the exit
+                # code is read without consuming the status (issue #25).
+                early_exit_code = proc_exit_status_unreaped(proc)
                 if trace is not None:
                     self._trace_event(
                         "process_exit",
                         req_key=attempt_key,
                         pid=proc.pid,
                         detail={
-                            "exit_code": proc.poll(),
+                            "exit_code": early_exit_code,
                             "waiting_on": method,
                         },
                     )
@@ -5230,7 +5242,7 @@ class AntigravityACPClient:
                     # the exception's structured attribute, never in its text.
                     raise _AcpEarlyExitError(
                         "Antigravity ACP process exited early (exit code "
-                        f"{proc.poll()}); {_acp_stderr_diagnostic(list(stderr_tail))}. "
+                        f"{early_exit_code}); {_acp_stderr_diagnostic(list(stderr_tail))}. "
                         "Inspect the configured ACP command's own output manually "
                         "if more detail is required.",
                         acp_retry_class=_acp_stderr_retry_class(list(stderr_tail)),
@@ -5356,7 +5368,7 @@ class AntigravityACPClient:
                 with self._active_process_lock:
                     self._trace_inflight.pop(attempt_key, None)
             entry["next_id"] = id_state["last"] + 1
-            if poisoned or proc.poll() is not None:
+            if poisoned or proc_dead_unreaped(proc):
                 self._release_process(proc)
             else:
                 self._warm_park(entry)
