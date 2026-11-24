@@ -3774,9 +3774,14 @@ POSTPROCESSING_POLICIES = (POSTPROCESSING_POLICY_AGENT, POSTPROCESSING_POLICY_LL
 # ``_active_processes`` so ``close()`` never kills them; ``atexit``, the
 # idle TTL and the per-key pool cap bound their lifetime instead.
 _WARM_IDLE_TTL_SECONDS = float(
-    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS", "120")
+    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_TTL_SECONDS", "30")
 )
-_WARM_POOL_MAX_PER_KEY = 4
+_WARM_POOL_MAX_PER_KEY = int(
+    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_MAX_PER_KEY", "2")
+)
+_WARM_POOL_MAX_TOTAL = int(
+    os.environ.get("HERMES_ANTIGRAVITY_ACP_WARM_MAX_TOTAL", "6")
+)
 _warm_pool_lock = threading.Lock()
 # key: (command, args tuple, cwd, affinity key) -> list of parked entries.
 # entry: {proc, inbox, stderr_tail, stderr_reader, next_id, idle_since, key}
@@ -3965,17 +3970,40 @@ class AntigravityACPClient:
         with self._active_process_lock:
             self._active_processes.discard(entry["proc"])
         victims: list[dict[str, Any]] = []
+        now = time.monotonic()
         with _warm_pool_lock:
-            bucket: list[dict[str, Any]] = []
-            for parked in _warm_pool.get(entry["key"], []):
-                if parked["proc"].poll() is None:
-                    bucket.append(parked)
+            dead_keys: list[Any] = []
+            for k, entries in _warm_pool.items():
+                kept: list[dict[str, Any]] = []
+                for p in entries:
+                    if p["proc"].poll() is not None or (now - p["idle_since"] > _WARM_IDLE_TTL_SECONDS):
+                        victims.append(p)
+                    else:
+                        kept.append(p)
+                if kept:
+                    _warm_pool[k] = kept
                 else:
-                    victims.append(parked)
+                    dead_keys.append(k)
+            for k in dead_keys:
+                _warm_pool.pop(k, None)
+
+            bucket: list[dict[str, Any]] = _warm_pool.get(entry["key"], [])
             bucket.append(entry)
             while len(bucket) > _WARM_POOL_MAX_PER_KEY:
                 victims.append(bucket.pop(0))
             _warm_pool[entry["key"]] = bucket
+
+            total_parked = sum(len(v) for v in _warm_pool.values())
+            if total_parked > _WARM_POOL_MAX_TOTAL:
+                flat = [(p["idle_since"], k, p) for k, v in _warm_pool.items() for p in v]
+                flat.sort(key=lambda x: x[0])
+                for _, k, p in flat[:(total_parked - _WARM_POOL_MAX_TOTAL)]:
+                    if k in _warm_pool and p in _warm_pool[k]:
+                        _warm_pool[k].remove(p)
+                        victims.append(p)
+                        if not _warm_pool[k]:
+                            _warm_pool.pop(k, None)
+
             if not _warm_pool_atexit_armed:
                 atexit.register(_shutdown_warm_pool)
                 _warm_pool_atexit_armed = True
