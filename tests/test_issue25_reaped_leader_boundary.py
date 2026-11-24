@@ -384,6 +384,38 @@ def test_session_lifecycle_seams_use_the_non_reaping_primitive(monkeypatch):
     )
 
 
+def test_warm_park_evicts_expired_entries_across_keys_and_caps_total(monkeypatch):
+    _facade, client, module = _load(monkeypatch)
+    monkeypatch.setattr(module, "_warm_pool", {})
+    monkeypatch.setattr(module, "_warm_pool_atexit_armed", True)
+    monkeypatch.setattr(module, "_WARM_IDLE_TTL_SECONDS", 30)
+    monkeypatch.setattr(module, "_WARM_POOL_MAX_PER_KEY", 2, raising=False)
+    monkeypatch.setattr(module, "_WARM_POOL_MAX_TOTAL", 2, raising=False)
+    monkeypatch.setattr(module, "proc_dead_unreaped", lambda _proc: False)
+    evicted = []
+    monkeypatch.setattr(module, "_terminate_parked", evicted.append)
+    now = 0
+    monkeypatch.setattr(module.time, "monotonic", lambda: now)
+
+    def park(lane):
+        proc = object()
+        client._warm_park({"key": ("cmd", (), ".", lane), "proc": proc})
+        return proc
+
+    expired = park("expired")
+    now = 31
+    oldest = park("oldest")
+    now += 1
+    kept = park("kept")
+    now += 1
+    newest = park("newest")
+
+    assert evicted == [expired, oldest]
+    assert [p["proc"] for entries in module._warm_pool.values() for p in entries] == [
+        kept, newest,
+    ]
+
+
 def test_warm_park_sweep_terminates_dead_parked_sibling_untouched(
     monkeypatch, tmp_path
 ):
